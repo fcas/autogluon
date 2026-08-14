@@ -19,7 +19,6 @@ from ..constants import (
     DOCUMENT_IMAGE,
     DOCUMENT_PDF,
     IDENTIFIER,
-    IMAGE,
     IMAGE_BASE64_STR,
     IMAGE_BYTEARRAY,
     IMAGE_PATH,
@@ -37,7 +36,6 @@ from ..constants import (
     TEXT,
     TEXT_NER,
 )
-from .utils import is_rois_input
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +110,22 @@ def is_categorical_column(
                 return False
         except:
             return False
+
+
+def is_rois_input(sample):
+    """
+    check if a sample is rois for object detection
+
+    Parameters
+    ----------
+    sample
+        The sampled data.
+
+    Returns
+    -------
+    bool, whether a sample is rois for object detection
+    """
+    return isinstance(sample, list) and len(sample) and isinstance(sample[0], list) and len(sample[0]) == 5
 
 
 def is_rois_column(data: pd.Series) -> bool:
@@ -235,9 +249,9 @@ def is_image_column(
                 f"Among {sample_num} sampled images in column '{col_name}', "
                 f"{failure_ratio:.0%} images can't be open. "
                 "You may need to thoroughly check your data to see the percentage of missing images, "
-                "and estimate the potential influence. By default, we skip the samples with missing images. "
-                "You can also set hyperparameter 'data.image.missing_value_strategy' to be 'zero', "
-                "which uses a zero image to replace any missing image.",
+                "and estimate the potential influence. By default, we use an image with zero pixels. "
+                "You can also set hyperparameter 'data.image.missing_value_strategy' to be 'skip', "
+                "which skips samples that contain a missing image.",
                 UserWarning,
             )
         return True
@@ -290,10 +304,23 @@ def is_document_image_column(
     col_name: str,
     image_type: Optional[str] = IMAGE_PATH,
     sample_m: Optional[int] = 10,
-    text_len_threshold: Optional[int] = 100,
+    min_text_len_threshold: Optional[int] = 200,
+    text_density_threshold: Optional[float] = 0.001,
+    min_line_count: Optional[int] = 3,
+    min_document_ratio: Optional[float] = 0.8,
 ) -> bool:
     """
     Identify if a column is a document image column.
+
+    Document images are images that primarily contain text (e.g., scanned documents,
+    screenshots of text, PDFs rendered as images). Regular photographs, maps,
+    charts with labels, or images with watermarks/captions should NOT be
+    classified as document images.
+
+    The detection uses multiple heuristics:
+    1. Minimum absolute text length (short text like watermarks is ignored)
+    2. Text density relative to image size (documents have high text-to-pixel ratio)
+    3. Line count (documents typically have multiple lines of text)
 
     Parameters
     ----------
@@ -305,46 +332,90 @@ def is_document_image_column(
         The image type to check. Set to IMAGE_PATH by default.
     sample_m
         Number of sample images used to check if images are documents images.
-    text_len_threshold
-        If the average text length is longer than text_len_threshold, the images will be considered as document images.
+    min_text_len_threshold
+        Minimum text length to even consider an image as a potential document.
+        This filters out images with just watermarks or short captions.
+    text_density_threshold
+        Minimum ratio of (text_characters / image_pixels) to consider as document.
+        Documents typically have much higher text density than photos with labels.
+    min_line_count
+        Minimum number of non-empty text lines expected in a document.
+    min_document_ratio
+        Minimum ratio of images that must be classified as documents for the
+        entire column to be treated as a document column.
+
     Returns
     -------
     Whether the column is a document image column.
     """
+    if data.empty:
+        return False
 
-    # TODO: Add support for other types (e.g., pdf) of document.
-
-    words_len = []
     if len(data) > sample_m:
-        # Sample to speed-up type inference
         data = data.sample(n=sample_m, random_state=0)
-    failure_count = 0
+
+    document_count = 0
+    total_processed = 0
+
     for images in data:
-        success = False
+        if images is None:
+            continue
+
         if not isinstance(images, list):
             images = [images]
-        for per_image in images:
-            try:
-                # convert images to string
-                with PIL.Image.open(per_image) as doc_image:
-                    words = pytesseract.image_to_string(doc_image)
-                    words_len.append(len(words))
-            except Exception as e:
-                words_len.append(0)
-                success = False
-                break
-            success = True
-        if not success:
-            failure_count += 1
 
-    if (1 - failure_count / sample_m) >= 0.8:
-        logger.debug(f"Average length of words of this dataset is {sum(words_len) / len(words_len)}.")
-        if sum(words_len) / len(words_len) > text_len_threshold:
-            return True
-        else:
-            return False
-    else:
-        False
+        for per_image in images:
+            if not isinstance(per_image, str):
+                total_processed += 1
+                continue
+
+            try:
+                with PIL.Image.open(per_image) as img:
+                    width, height = img.size
+                    total_pixels = width * height
+
+                    ocr_text = pytesseract.image_to_string(img)
+                    text_length = len(ocr_text.strip())
+
+                    total_processed += 1
+
+                    # Heuristic 1: Minimum absolute text length
+                    # Filters out watermarks, copyright notices, short captions
+                    if text_length < min_text_len_threshold:
+                        continue
+
+                    # Heuristic 2: Text density (characters per pixel)
+                    # Documents have dense text; photos with small labels don't
+                    text_density = text_length / total_pixels
+                    if text_density < text_density_threshold:
+                        continue
+
+                    # Heuristic 3: Line count
+                    # Documents have multiple lines; watermarks are 1-2 lines
+                    lines = [line for line in ocr_text.split("\n") if line.strip()]
+                    if len(lines) < min_line_count:
+                        continue
+
+                    # Passed all heuristics - this looks like a document
+                    document_count += 1
+
+            except Exception as e:
+                logger.debug(f"Failed to process image {per_image}: {e}")
+                total_processed += 1
+
+    if total_processed == 0:
+        return False
+
+    document_ratio = document_count / total_processed
+    is_document_column = document_ratio >= min_document_ratio
+
+    logger.debug(
+        f"Column '{col_name}': {document_count}/{total_processed} images "
+        f"({document_ratio:.1%}) classified as documents. "
+        f"Column type: {'document' if is_document_column else 'regular'} images."
+    )
+
+    return is_document_column
 
 
 def is_text_column(data: pd.Series) -> bool:
@@ -755,8 +826,7 @@ def infer_output_shape(
     if problem_type in [BINARY, MULTICLASS, REGRESSION, CLASSIFICATION]:
         class_num = len(data[label_column].unique())
         err_msg = (
-            f"Problem type is '{problem_type}' while the number of "
-            f"unique values in the label column is {class_num}."
+            f"Problem type is '{problem_type}' while the number of unique values in the label column is {class_num}."
         )
         if problem_type == BINARY:
             if class_num != 2:
@@ -828,9 +898,7 @@ def infer_ner_column_type(column_types: Dict):
     if any([col_type.startswith(TEXT_NER) for col_type in column_types.values()]):
         return column_types
 
-    for (
-        column
-    ) in (
+    for column in (
         column_types.keys()
     ):  # column_types is an ordered dict, so column_types.keys() returns the keys in the order of insertions.
         if column_types[column].startswith(TEXT):

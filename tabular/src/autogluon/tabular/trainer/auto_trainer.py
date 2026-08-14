@@ -1,19 +1,19 @@
 import logging
-from typing import Dict, List
 
 from autogluon.core.models import AbstractModel
-from autogluon.core.trainer.abstract_trainer import AbstractTrainer
 from autogluon.core.utils import generate_train_test_split
 
 from ..models.lgb.lgb_model import LGBModel
-from .model_presets.presets import MODEL_TYPES, get_preset_models
+from ..registry import ag_model_registry
+from .abstract_trainer import AbstractTabularTrainer
+from .model_presets.presets import get_preset_models
 from .model_presets.presets_distill import get_preset_models_distillation
 
 logger = logging.getLogger(__name__)
 
 
 # This Trainer handles model training details
-class AutoTrainer(AbstractTrainer):
+class AutoTrainer(AbstractTabularTrainer):
     def construct_model_templates(self, hyperparameters, **kwargs):
         path = kwargs.pop("path", self.path)
         problem_type = kwargs.pop("problem_type", self.problem_type)
@@ -46,6 +46,8 @@ class AutoTrainer(AbstractTrainer):
         hyperparameters,
         X_val=None,
         y_val=None,
+        X_test=None,
+        y_test=None,
         X_unlabeled=None,
         holdout_frac=0.1,
         num_stack_levels=0,
@@ -56,6 +58,9 @@ class AutoTrainer(AbstractTrainer):
         infer_limit_batch_size=None,
         use_bag_holdout=False,
         groups=None,
+        validation_structure=None,
+        callbacks: list[callable] = None,
+        label_cleaner=None,
         **kwargs,
     ):
         for key in kwargs:
@@ -63,31 +68,62 @@ class AutoTrainer(AbstractTrainer):
 
         if use_bag_holdout:
             if self.bagged_mode:
-                logger.log(20, f"use_bag_holdout={use_bag_holdout}, will use tuning_data as holdout (will not be used for early stopping).")
+                logger.log(
+                    20,
+                    f"use_bag_holdout={use_bag_holdout}, will use tuning_data as holdout (will not be used for early stopping).",
+                )
             else:
-                logger.warning(f"Warning: use_bag_holdout={use_bag_holdout}, but bagged mode is not enabled. use_bag_holdout will be ignored.")
+                logger.warning(
+                    f"Warning: use_bag_holdout={use_bag_holdout}, but bagged mode is not enabled. use_bag_holdout will be ignored."
+                )
 
         if (y_val is None) or (X_val is None):
             if not self.bagged_mode or use_bag_holdout:
                 if groups is not None:
-                    raise AssertionError(f"Validation data must be manually specified if use_bag_holdout and groups are both specified.")
+                    raise AssertionError(
+                        f"Validation data must be manually specified if use_bag_holdout and groups are both specified."
+                    )
                 if self.bagged_mode:
                     # Need at least 2 samples of each class in train data after split for downstream k-fold splits
                     # to ensure each k-fold has at least 1 sample of each class in training data
                     min_cls_count_train = 2
                 else:
                     min_cls_count_train = 1
-                X, X_val, y, y_val = generate_train_test_split(
-                    X,
-                    y,
-                    problem_type=self.problem_type,
-                    test_size=holdout_frac,
-                    random_state=self.random_state,
-                    min_cls_count_train=min_cls_count_train,
-                )
-                logger.log(
-                    20, f"Automatically generating train/validation split with holdout_frac={holdout_frac}, Train Rows: {len(X)}, Val Rows: {len(X_val)}"
-                )
+                structure_split = None
+                if validation_structure is not None:
+                    # Group-disjoint or temporally-forward holdout; None when the
+                    # structure needs no correction (stratify-only).
+                    structure_split = validation_structure.holdout_split_indices(
+                        X,
+                        y,
+                        holdout_frac=holdout_frac,
+                        random_state=self.random_state,
+                        problem_type=self.problem_type,
+                        # Same per-class floor the unstructured split below enforces; without it
+                        # the structured path was the only one with no such guarantee.
+                        min_cls_count_train=min_cls_count_train,
+                    )
+                if structure_split is not None:
+                    train_idx, val_idx = structure_split
+                    X, X_val, y, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
+                    logger.log(
+                        20,
+                        f"Generating structure-aware train/validation split with holdout_frac={holdout_frac}, "
+                        f"Train Rows: {len(X)}, Val Rows: {len(X_val)}",
+                    )
+                else:
+                    X, X_val, y, y_val = generate_train_test_split(
+                        X,
+                        y,
+                        problem_type=self.problem_type,
+                        test_size=holdout_frac,
+                        random_state=self.random_state,
+                        min_cls_count_train=min_cls_count_train,
+                    )
+                    logger.log(
+                        20,
+                        f"Automatically generating train/validation split with holdout_frac={holdout_frac}, Train Rows: {len(X)}, Val Rows: {len(X_val)}",
+                    )
         elif self.bagged_mode:
             if not use_bag_holdout:
                 # TODO: User could be intending to blend instead. Add support for blend stacking.
@@ -109,24 +145,38 @@ class AutoTrainer(AbstractTrainer):
         extra_log_str = ""
         display_all = (n_configs < 20) or (self.verbosity >= 3)
         if not display_all:
+            # FIXME: This isn't correct
             extra_log_str = (
-                f"Large model count detected ({n_configs} configs) ... " f"Only displaying the first 3 models of each family. To see all, set `verbosity=3`.\n"
+                f"Large model count detected ({n_configs} configs) ... "
+                f"Only displaying the first 3 models of each family. To see all, set `verbosity=3`.\n"
             )
-        log_str = f"{extra_log_str}User-specified model hyperparameters to be fit:\n" "{\n"
+        log_str = f"{extra_log_str}User-specified model hyperparameters to be fit:\n{{\n"
         if display_all:
             for k in hyperparameters.keys():
-                log_str += f"\t'{k}': {hyperparameters[k]},\n"
+                # TODO: Make hyperparameters[k] be a list upstream to avoid needing these edge-cases
+                if not isinstance(hyperparameters[k], list):
+                    log_str += f"\t'{k}': {[hyperparameters[k]]},\n"
+                else:
+                    log_str += f"\t'{k}': {hyperparameters[k]},\n"
         else:
             for k in hyperparameters.keys():
-                log_str += f"\t'{k}': {hyperparameters[k][:3]},\n"
+                if not isinstance(hyperparameters[k], list):
+                    log_str += f"\t'{k}': {[hyperparameters[k]]},\n"
+                else:
+                    log_str += f"\t'{k}': {hyperparameters[k][:3]},\n"
         log_str += "}"
         logger.log(20, log_str)
+
+        if label_cleaner is not None:
+            core_kwargs["label_cleaner"] = label_cleaner
 
         self._train_multi_and_ensemble(
             X=X,
             y=y,
             X_val=X_val,
             y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
             X_unlabeled=X_unlabeled,
             hyperparameters=hyperparameters,
             num_stack_levels=num_stack_levels,
@@ -136,6 +186,7 @@ class AutoTrainer(AbstractTrainer):
             infer_limit=infer_limit,
             infer_limit_batch_size=infer_limit_batch_size,
             groups=groups,
+            callbacks=callbacks,
         )
 
     def construct_model_templates_distillation(self, hyperparameters, **kwargs):
@@ -160,7 +211,7 @@ class AutoTrainer(AbstractTrainer):
     def _get_default_proxy_model_class(self):
         return LGBModel
 
-    def compile(self, model_names="all", with_ancestors=False, compiler_configs: dict = None) -> List[str]:
+    def compile(self, model_names="all", with_ancestors=False, compiler_configs: dict = None) -> list[str]:
         """Ensures that compiler_configs maps to the correct models if the user specified the same keys as in hyperparameters such as RT, XT, etc."""
         if compiler_configs is not None:
             model_types_map = self._get_model_types_map()
@@ -171,7 +222,9 @@ class AutoTrainer(AbstractTrainer):
                 else:
                     compiler_configs_new[k] = compiler_configs[k]
             compiler_configs = compiler_configs_new
-        return super().compile(model_names=model_names, with_ancestors=with_ancestors, compiler_configs=compiler_configs)
+        return super().compile(
+            model_names=model_names, with_ancestors=with_ancestors, compiler_configs=compiler_configs
+        )
 
-    def _get_model_types_map(self) -> Dict[str, AbstractModel]:
-        return MODEL_TYPES
+    def _get_model_types_map(self) -> dict[str, AbstractModel]:
+        return ag_model_registry.key_to_cls_map()

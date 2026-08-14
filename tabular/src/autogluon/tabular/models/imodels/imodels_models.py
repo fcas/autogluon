@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import abstractmethod
 
 import numpy as np
@@ -9,9 +11,16 @@ from autogluon.core.models import AbstractModel
 
 
 class _IModelsModel(AbstractModel):
+    _supported_problem_types = ["binary", "multiclass", "regression"]
+
+    _default_auxiliary_params_extra = dict(
+        get_features_kwargs=dict(
+            valid_raw_types=["int", "float", "category"],
+        ),
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._feature_generator = None
         self._ohe = None
         self._ohe_columns = None
         self._categorical_featnames = None
@@ -51,7 +60,7 @@ class _IModelsModel(AbstractModel):
 
     def _fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):  # training data  # training labels
         model_cls = self.get_model()
-        X = self.preprocess(X, is_train=True)
+        X = self.preprocess(X, y=y, is_train=True)
         params = self._get_model_params()
         self.model = model_cls(**params)
         self.model.fit(X, y, feature_names=X.columns.values.tolist())
@@ -63,18 +72,11 @@ class _IModelsModel(AbstractModel):
         for param, val in default_params.items():
             self._set_default_param_value(param, val)
 
-    def _get_default_auxiliary_params(self) -> dict:
-        default_auxiliary_params = super()._get_default_auxiliary_params()
-        extra_auxiliary_params = dict(
-            get_features_kwargs=dict(
-                valid_raw_types=["int", "float", "category"],
-            ),
-        )
-        default_auxiliary_params.update(extra_auxiliary_params)
-        return default_auxiliary_params
-
 
 class RuleFitModel(_IModelsModel):
+    ag_key = "IM_RULEFIT"
+    ag_name = "RuleFit"
+
     def get_model(self):
         try_import_imodels()
         from imodels import RuleFitClassifier, RuleFitRegressor
@@ -86,6 +88,9 @@ class RuleFitModel(_IModelsModel):
 
 
 class GreedyTreeModel(_IModelsModel):
+    ag_key = "IM_GREEDYTREE"
+    ag_name = "GreedyTree"
+
     def get_model(self):
         try_import_imodels()
         from imodels import GreedyTreeClassifier
@@ -98,6 +103,9 @@ class GreedyTreeModel(_IModelsModel):
 
 
 class BoostedRulesModel(_IModelsModel):
+    ag_key = "IM_BOOSTEDRULES"
+    ag_name = "BoostedRules"
+
     def get_model(self):
         try_import_imodels()
         from imodels import BoostedRulesClassifier
@@ -109,6 +117,9 @@ class BoostedRulesModel(_IModelsModel):
 
 
 class HSTreeModel(_IModelsModel):
+    ag_key = "IM_HSTREE"
+    ag_name = "HierarchicalShrinkageTree"
+
     def get_model(self):
         try_import_imodels()
         from imodels import HSTreeClassifierCV, HSTreeRegressorCV
@@ -120,6 +131,9 @@ class HSTreeModel(_IModelsModel):
 
 
 class FigsModel(_IModelsModel):
+    ag_key = "IM_FIGS"
+    ag_name = "Figs"
+
     def get_model(self):
         try_import_imodels()
         from imodels import FIGSClassifier, FIGSRegressor

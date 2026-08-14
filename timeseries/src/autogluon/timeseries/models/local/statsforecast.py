@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Type
+from typing import Any, Type
 
 import numpy as np
 import pandas as pd
@@ -14,22 +14,24 @@ class AbstractStatsForecastModel(AbstractLocalModel):
 
     init_time_in_seconds = 15  # numba compilation for the first run
 
-    def _update_local_model_args(self, local_model_args: Dict[str, Any]) -> Dict[str, Any]:
+    def _update_local_model_args(self, local_model_args: dict[str, Any]) -> dict[str, Any]:
         seasonal_period = local_model_args.pop("seasonal_period")
         local_model_args["season_length"] = seasonal_period
         return local_model_args
 
-    def _get_model_type(self) -> Type:
+    def _get_model_type(self, variant: str | None = None) -> Type:
         raise NotImplementedError
 
-    def _get_local_model(self, local_model_args: Dict):
-        model_type = self._get_model_type()
+    def _get_local_model(self, local_model_args: dict):
+        local_model_args = local_model_args.copy()
+        variant = local_model_args.pop("variant", None)
+        model_type = self._get_model_type(variant)
         return model_type(**local_model_args)
 
     def _get_point_forecast(
         self,
         time_series: pd.Series,
-        local_model_args: Dict,
+        local_model_args: dict,
     ) -> np.ndarray:
         return self._get_local_model(local_model_args).forecast(
             h=self.prediction_length, y=time_series.values.ravel()
@@ -49,15 +51,7 @@ class AbstractProbabilisticStatsForecastModel(AbstractStatsForecastModel):
         time_series: pd.Series,
         local_model_args: dict,
     ) -> pd.DataFrame:
-        # Code does conversion between confidence levels and quantiles
-        levels = []
-        quantile_to_key = {}
-        for q in self.quantile_levels:
-            level = round(abs(q - 0.5) * 200, 1)
-            suffix = "lo" if q < 0.5 else "hi"
-            levels.append(level)
-            quantile_to_key[str(q)] = f"{suffix}-{level}"
-        levels = sorted(list(set(levels)))
+        levels, quantile_to_key = self._get_confidence_levels()
 
         forecast = self._get_local_model(local_model_args).forecast(
             h=self.prediction_length, y=time_series.values.ravel(), level=levels
@@ -66,6 +60,18 @@ class AbstractProbabilisticStatsForecastModel(AbstractStatsForecastModel):
         for q, key in quantile_to_key.items():
             predictions[q] = forecast[key]
         return pd.DataFrame(predictions)
+
+    def _get_confidence_levels(self) -> tuple[list[float], dict[str, str]]:
+        """Get StatsForecast compatible levels from quantiles"""
+        levels = []
+        quantile_to_key = {}
+        for q in self.quantile_levels:
+            level = round(abs(q - 0.5) * 200, 1)
+            suffix = "lo" if q < 0.5 else "hi"
+            levels.append(level)
+            quantile_to_key[str(q)] = f"{suffix}-{level}"
+        levels = sorted(list(set(levels)))
+        return levels, quantile_to_key
 
 
 class AutoARIMAModel(AbstractProbabilisticStatsForecastModel):
@@ -117,7 +123,7 @@ class AutoARIMAModel(AbstractProbabilisticStatsForecastModel):
         When set to None, seasonal_period will be inferred from the frequency of the training data. Can also be
         specified manually by providing an integer > 1.
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -127,6 +133,8 @@ class AutoARIMAModel(AbstractProbabilisticStatsForecastModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
+    ag_priority = 60
+    init_time_in_seconds = 0  # C++ models require no compilation
     allowed_local_model_args = [
         "d",
         "D",
@@ -154,7 +162,7 @@ class AutoARIMAModel(AbstractProbabilisticStatsForecastModel):
         local_model_args.setdefault("allowmean", True)
         return local_model_args
 
-    def _get_model_type(self):
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import AutoARIMA
 
         return AutoARIMA
@@ -168,9 +176,9 @@ class ARIMAModel(AbstractProbabilisticStatsForecastModel):
 
     Other Parameters
     ----------------
-    order: Tuple[int, int, int], default = (1, 1, 1)
+    order: tuple[int, int, int], default = (1, 1, 1)
         The (p, d, q) order of the model for the number of AR parameters, differences, and MA parameters to use.
-    seasonal_order: Tuple[int, int, int], default = (0, 0, 0)
+    seasonal_order: tuple[int, int, int], default = (0, 0, 0)
         The (P, D, Q) parameters of the seasonal ARIMA model. Setting to (0, 0, 0) disables seasonality.
     include_mean : bool, default = True
         Should the ARIMA model include a mean term?
@@ -186,7 +194,7 @@ class ARIMAModel(AbstractProbabilisticStatsForecastModel):
     method : {"CSS-ML", "CSS", "ML"}, default = "CSS-ML"
         Fitting method: CSS (conditional sum of squares), ML (maximum likelihood), CSS-ML (initialize with CSS, then
         optimize with ML).
-    fixed : Dict[str, float], optional
+    fixed : dict[str, float], optional
         Dictionary containing fixed coefficients for the ARIMA model.
     seasonal_period : int or None, default = None
         Number of time steps in a complete seasonal cycle for seasonal models. For example, 7 for daily data with a
@@ -194,7 +202,7 @@ class ARIMAModel(AbstractProbabilisticStatsForecastModel):
         When set to None, seasonal_period will be inferred from the frequency of the training data. Can also be
         specified manually by providing an integer > 1.
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -204,8 +212,8 @@ class ARIMAModel(AbstractProbabilisticStatsForecastModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
-    # TODO: This model requires statsforecast >= 1.5.0, so it will only be available after we upgrade the dependency
-
+    ag_priority = 10
+    init_time_in_seconds = 0  # C++ models require no compilation
     allowed_local_model_args = [
         "order",
         "seasonal_order",
@@ -224,7 +232,7 @@ class ARIMAModel(AbstractProbabilisticStatsForecastModel):
         local_model_args.setdefault("order", (1, 1, 1))
         return local_model_args
 
-    def _get_model_type(self):
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import ARIMA
 
         return ARIMA
@@ -251,7 +259,7 @@ class AutoETSModel(AbstractProbabilisticStatsForecastModel):
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
     damped : bool, default = False
         Whether to dampen the trend.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -261,13 +269,15 @@ class AutoETSModel(AbstractProbabilisticStatsForecastModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
+    ag_priority = 60
+    init_time_in_seconds = 0  # C++ models require no compilation
     allowed_local_model_args = [
         "damped",
         "model",
         "seasonal_period",
     ]
 
-    def _get_model_type(self):
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import AutoETS
 
         return AutoETS
@@ -286,7 +296,7 @@ class AutoETSModel(AbstractProbabilisticStatsForecastModel):
         # Disable seasonality if time series too short for chosen season_length, season_length is too high, or
         # season_length == 1. Otherwise model will crash
         season_length = local_model_args["season_length"]
-        if len(time_series) < 2 * season_length or season_length == 1 or season_length > 24:
+        if len(time_series) < 2 * season_length or season_length == 1:
             # changing last character to "N" disables seasonality, e.g., model="AAA" -> model="AAN"
             local_model_args["model"] = local_model_args["model"][:-1] + "N"
         return super()._predict_with_local_model(time_series=time_series, local_model_args=local_model_args)
@@ -313,7 +323,7 @@ class ETSModel(AutoETSModel):
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
     damped : bool, default = False
         Whether to dampen the trend.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -322,6 +332,8 @@ class ETSModel(AutoETSModel):
         If not None, only the last ``max_ts_length`` time steps of each time series will be used to train the model.
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
+
+    ag_priority = 80
 
     def _update_local_model_args(self, local_model_args: dict) -> dict:
         local_model_args = super()._update_local_model_args(local_model_args)
@@ -352,7 +364,7 @@ class DynamicOptimizedThetaModel(AbstractProbabilisticStatsForecastModel):
         When set to None, seasonal_period will be inferred from the frequency of the training data. Can also be
         specified manually by providing an integer > 1.
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -362,12 +374,13 @@ class DynamicOptimizedThetaModel(AbstractProbabilisticStatsForecastModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
+    ag_priority = 75
     allowed_local_model_args = [
         "decomposition_type",
         "seasonal_period",
     ]
 
-    def _get_model_type(self):
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import DynamicOptimizedTheta
 
         return DynamicOptimizedTheta
@@ -396,7 +409,7 @@ class ThetaModel(AbstractProbabilisticStatsForecastModel):
         When set to None, seasonal_period will be inferred from the frequency of the training data. Can also be
         specified manually by providing an integer > 1.
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -406,12 +419,13 @@ class ThetaModel(AbstractProbabilisticStatsForecastModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
+    ag_priority = 75
     allowed_local_model_args = [
         "decomposition_type",
         "seasonal_period",
     ]
 
-    def _get_model_type(self):
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import Theta
 
         return Theta
@@ -435,7 +449,7 @@ class AbstractConformalizedStatsForecastModel(AbstractStatsForecastModel):
     def _get_nonconformity_scores(
         self,
         time_series: pd.Series,
-        local_model_args: Dict,
+        local_model_args: dict,
     ) -> np.ndarray:
         h = self.prediction_length
         y = time_series.values.ravel()
@@ -491,10 +505,9 @@ class AbstractConformalizedStatsForecastModel(AbstractStatsForecastModel):
         return pd.DataFrame(predictions)
 
 
-# TODO: Starting from StatsForecast v1.5.0, AutoCES can inherit from AbstractProbabilisticStatsForecastModel
-class AutoCESModel(AbstractConformalizedStatsForecastModel):
+class AutoCESModel(AbstractProbabilisticStatsForecastModel):
     """Forecasting with an Complex Exponential Smoothing model where the model selection is performed using the
-    Akaike Information Criterion.
+    Akaike Information Criterion [Svetunkov2022]_.
 
     Based on `statsforecast.models.AutoCES <https://nixtla.mintlify.app/statsforecast/docs/models/autoces.html>`_.
 
@@ -517,7 +530,7 @@ class AutoCESModel(AbstractConformalizedStatsForecastModel):
         When set to None, seasonal_period will be inferred from the frequency of the training data. Can also be
         specified manually by providing an integer > 1.
         If seasonal_period (inferred or provided) is equal to 1, seasonality will be disabled.
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -527,12 +540,13 @@ class AutoCESModel(AbstractConformalizedStatsForecastModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
+    ag_priority = 10
     allowed_local_model_args = [
         "model",
         "seasonal_period",
     ]
 
-    def _get_model_type(self):
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import AutoCES
 
         return AutoCES
@@ -542,7 +556,7 @@ class AutoCESModel(AbstractConformalizedStatsForecastModel):
         local_model_args.setdefault("model", "Z")
         return local_model_args
 
-    def _get_point_forecast(self, time_series: pd.Series, local_model_args: Dict):
+    def _get_point_forecast(self, time_series: pd.Series, local_model_args: dict):
         # Disable seasonality if time series too short for chosen season_length or season_length == 1,
         # otherwise model will crash
         if len(time_series) < 5:
@@ -554,7 +568,7 @@ class AutoCESModel(AbstractConformalizedStatsForecastModel):
 
 
 class AbstractStatsForecastIntermittentDemandModel(AbstractConformalizedStatsForecastModel):
-    def _update_local_model_args(self, local_model_args: Dict[str, Any]) -> Dict[str, Any]:
+    def _update_local_model_args(self, local_model_args: dict[str, Any]) -> dict[str, Any]:
         _ = local_model_args.pop("seasonal_period")
         return local_model_args
 
@@ -584,7 +598,7 @@ class ADIDAModel(AbstractStatsForecastIntermittentDemandModel):
 
     Other Parameters
     ----------------
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -594,28 +608,35 @@ class ADIDAModel(AbstractStatsForecastIntermittentDemandModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
-    def _get_model_type(self):
+    ag_priority = 10
+
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import ADIDA
 
         return ADIDA
 
 
-class CrostonSBAModel(AbstractStatsForecastIntermittentDemandModel):
-    """Intermittent demand forecasting model using Croston's model with the Syntetos-Boylan
-    bias correction approach [SyntetosBoylan2001]_.
-
-    Based on `statsforecast.models.CrostonSBA <https://nixtla.mintlify.app/statsforecast/docs/models/crostonsba.html>`_.
-
+class CrostonModel(AbstractStatsForecastIntermittentDemandModel):
+    """Intermittent demand forecasting model using Croston's model from [Croston1972]_ and [SyntetosBoylan2001]_.
 
     References
     ----------
+    .. [Croston1972] Croston, John D. "Forecasting and stock control for intermittent demands." Journal of
+        the Operational Research Society 23.3 (1972): 289-303.
     .. [SyntetosBoylan2001] Syntetos, Aris A., and John E. Boylan. "On the bias of intermittent
         demand estimates." International journal of production economics 71.1-3 (2001): 457-466.
 
 
     Other Parameters
     ----------------
-    n_jobs : int or float, default = 0.5
+    variant : {"SBA", "classic", "optimized"}, default = "SBA"
+        Variant of the Croston model that is used. Available options:
+
+        - ``"classic"`` - variant of the Croston method where the smoothing parameter is fixed to 0.1 (based on `statsforecast.models.CrostonClassic <https://nixtla.mintlify.app/statsforecast/docs/models/crostonclassic.html>`_)
+        - ``"SBA"`` - variant of the Croston method based on Syntetos-Boylan Approximation (based on `statsforecast.models.CrostonSBA <https://nixtla.mintlify.app/statsforecast/docs/models/crostonsba.html>`_)
+        - ``"optimized"`` - variant of the Croston method where the smoothing parameter is optimized (based on `statsforecast.models.CrostonOptimized <https://nixtla.mintlify.app/statsforecast/docs/models/crostonoptimized.html>`_)
+
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -625,72 +646,32 @@ class CrostonSBAModel(AbstractStatsForecastIntermittentDemandModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
-    def _get_model_type(self):
-        from statsforecast.models import CrostonSBA
+    ag_model_aliases = ["CrostonSBA"]
+    ag_priority = 80
+    allowed_local_model_args = [
+        "variant",
+    ]
 
-        return CrostonSBA
+    def _get_model_type(self, variant: str | None = None):
+        from statsforecast.models import CrostonClassic, CrostonOptimized, CrostonSBA
 
+        model_variants = {
+            "classic": CrostonClassic,
+            "sba": CrostonSBA,
+            "optimized": CrostonOptimized,
+        }
 
-class CrostonOptimizedModel(AbstractStatsForecastIntermittentDemandModel):
-    """Intermittent demand forecasting model using Croston's model where the smoothing parameter
-    is optimized [Croston1972]_.
+        if not isinstance(variant, str) or variant.lower() not in model_variants:
+            raise ValueError(
+                f"Invalid model variant '{variant}'. Available Croston model variants: {list(model_variants)}"
+            )
+        else:
+            return model_variants[variant.lower()]
 
-    Based on `statsforecast.models.CrostonOptimized <https://nixtla.mintlify.app/statsforecast/docs/models/crostonoptimized.html>`_.
-
-
-    References
-    ----------
-    .. [Croston1972] Croston, John D. "Forecasting and stock control for intermittent demands." Journal of
-        the Operational Research Society 23.3 (1972): 289-303.
-
-
-    Other Parameters
-    ----------------
-    n_jobs : int or float, default = 0.5
-        Number of CPU cores used to fit the models in parallel.
-        When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
-        When set to a positive integer, that many cores are used.
-        When set to -1, all CPU cores are used.
-    max_ts_length : int, default = 2500
-        If not None, only the last ``max_ts_length`` time steps of each time series will be used to train the model.
-        This significantly speeds up fitting and usually leads to no change in accuracy.
-    """
-
-    def _get_model_type(self):
-        from statsforecast.models import CrostonOptimized
-
-        return CrostonOptimized
-
-
-class CrostonClassicModel(AbstractStatsForecastIntermittentDemandModel):
-    """Intermittent demand forecasting model using Croston's model where the smoothing parameter
-    is fixed to 0.1 [Croston1972]_.
-
-    Based on `statsforecast.models.CrostonClassic <https://nixtla.mintlify.app/statsforecast/docs/models/crostonclassic.html>`_.
-
-
-    References
-    ----------
-    .. [Croston1972] Croston, John D. "Forecasting and stock control for intermittent demands." Journal of
-        the Operational Research Society 23.3 (1972): 289-303.
-
-
-    Other Parameters
-    ----------------
-    n_jobs : int or float, default = 0.5
-        Number of CPU cores used to fit the models in parallel.
-        When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
-        When set to a positive integer, that many cores are used.
-        When set to -1, all CPU cores are used.
-    max_ts_length : int, default = 2500
-        If not None, only the last ``max_ts_length`` time steps of each time series will be used to train the model.
-        This significantly speeds up fitting and usually leads to no change in accuracy.
-    """
-
-    def _get_model_type(self):
-        from statsforecast.models import CrostonClassic
-
-        return CrostonClassic
+    def _update_local_model_args(self, local_model_args: dict) -> dict:
+        local_model_args = super()._update_local_model_args(local_model_args)
+        local_model_args.setdefault("variant", "SBA")
+        return local_model_args
 
 
 class IMAPAModel(AbstractStatsForecastIntermittentDemandModel):
@@ -709,7 +690,7 @@ class IMAPAModel(AbstractStatsForecastIntermittentDemandModel):
 
     Other Parameters
     ----------------
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -719,7 +700,9 @@ class IMAPAModel(AbstractStatsForecastIntermittentDemandModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
-    def _get_model_type(self):
+    ag_priority = 10
+
+    def _get_model_type(self, variant: str | None = None):
         from statsforecast.models import IMAPA
 
         return IMAPA
@@ -731,7 +714,7 @@ class ZeroModel(AbstractStatsForecastIntermittentDemandModel):
 
     Other Parameters
     ----------------
-    n_jobs : int or float, default = 0.5
+    n_jobs : int or float, default = joblib.cpu_count(only_physical_cores=True)
         Number of CPU cores used to fit the models in parallel.
         When set to a float between 0.0 and 1.0, that fraction of available CPU cores is used.
         When set to a positive integer, that many cores are used.
@@ -741,13 +724,15 @@ class ZeroModel(AbstractStatsForecastIntermittentDemandModel):
         This significantly speeds up fitting and usually leads to no change in accuracy.
     """
 
-    def _get_model_type(self):
+    ag_priority = 100
+
+    def _get_model_type(self, variant: str | None = None):
         # ZeroModel does not depend on a StatsForecast implementation
         raise NotImplementedError
 
     def _get_point_forecast(
         self,
         time_series: pd.Series,
-        local_model_args: Dict,
+        local_model_args: dict,
     ):
         return np.zeros(self.prediction_length)

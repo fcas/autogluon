@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from collections.abc import Iterable
-from typing import List, Union
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -13,13 +13,12 @@ from pandas import DataFrame, Series
 from sklearn.metrics import classification_report
 
 from autogluon.core.constants import AUTO_WEIGHT, BALANCE_WEIGHT, BINARY, MULTICLASS, QUANTILE, REGRESSION
-from autogluon.core.data.label_cleaner import LabelCleaner, LabelCleanerMulticlassToBinary
+from autogluon.core.data.label_cleaner import LabelCleaner, LabelCleanerMulticlass, LabelCleanerMulticlassToBinary
 from autogluon.core.learner import AbstractLearner
-from autogluon.core.metrics import Scorer, confusion_matrix, get_metric
+from autogluon.core.metrics import Scorer, compute_metric, confusion_matrix, get_metric
 from autogluon.core.models.greedy_ensemble.ensemble_selection import EnsembleSelection
 from autogluon.core.utils import (
     augment_rare_classes,
-    compute_weighted_metric,
     extract_column,
     get_leaderboard_pareto_frontier,
     get_pred_from_proba,
@@ -40,19 +39,19 @@ class AbstractTabularLearner(AbstractLearner):
         self,
         path_context: str,
         label: str,
-        feature_generator: PipelineFeatureGenerator,
+        feature_generator: PipelineFeatureGenerator | None = None,
         ignored_columns: list = None,
-        label_count_threshold=10,
-        problem_type=None,
-        quantile_levels=None,
-        eval_metric=None,
-        positive_class=None,
-        cache_data=True,
-        is_trainer_present=False,
-        random_state=0,
-        sample_weight=None,
-        weight_evaluation=False,
-        groups=None,
+        label_count_threshold: int = 10,
+        problem_type: str | None = None,
+        quantile_levels: list[float] | None = None,
+        eval_metric: Scorer | None = None,
+        positive_class: str | None = None,
+        cache_data: bool = True,
+        is_trainer_present: bool = False,
+        random_state: int = 0,
+        sample_weight: str | None = None,
+        weight_evaluation: bool = False,
+        groups: str | None = None,
     ):
         super().__init__(path_context=path_context, random_state=random_state)
         self.label = label
@@ -61,6 +60,7 @@ class AbstractTabularLearner(AbstractLearner):
             self.ignored_columns = []
         self.threshold = label_count_threshold
         self.problem_type = problem_type
+        self._eval_metric_was_str = eval_metric is not None and isinstance(eval_metric, str)
         self.eval_metric = get_metric(eval_metric, self.problem_type, "eval_metric")
 
         if self.problem_type == QUANTILE and quantile_levels is None:
@@ -70,7 +70,10 @@ class AbstractTabularLearner(AbstractLearner):
         if isinstance(quantile_levels, Iterable):
             for quantile in quantile_levels:
                 if quantile <= 0.0 or quantile >= 1.0:
-                    raise ValueError("quantile values have to be non-negative and less than 1.0 (0.0 < q < 1.0). " "For example, 0.95 quantile = 95 percentile")
+                    raise ValueError(
+                        "quantile values have to be non-negative and less than 1.0 (0.0 < q < 1.0). "
+                        "For example, 0.95 quantile = 95 percentile"
+                    )
             quantile_levels = np.sort(np.array(quantile_levels))
         self.quantile_levels = quantile_levels
 
@@ -188,7 +191,11 @@ class AbstractTabularLearner(AbstractLearner):
                 X = self.transform_features(X)
             y_pred_proba = self.load_trainer().predict_proba(X, model=model)
         y_pred_proba = self._post_process_predict_proba(
-            y_pred_proba=y_pred_proba, as_pandas=as_pandas, index=X_index, as_multiclass=as_multiclass, inverse_transform=inverse_transform
+            y_pred_proba=y_pred_proba,
+            as_pandas=as_pandas,
+            index=X_index,
+            as_multiclass=as_multiclass,
+            inverse_transform=inverse_transform,
         )
         return y_pred_proba
 
@@ -206,11 +213,20 @@ class AbstractTabularLearner(AbstractLearner):
             decision_threshold = 0.5
         X_index = copy.deepcopy(X.index) if as_pandas else None
         y_pred_proba = self.predict_proba(
-            X=X, model=model, as_pandas=False, as_multiclass=False, inverse_transform=False, transform_features=transform_features
+            X=X,
+            model=model,
+            as_pandas=False,
+            as_multiclass=False,
+            inverse_transform=False,
+            transform_features=transform_features,
         )
         problem_type = self.label_cleaner.problem_type_transform or self.problem_type
-        y_pred = get_pred_from_proba(y_pred_proba=y_pred_proba, problem_type=problem_type, decision_threshold=decision_threshold)
-        y_pred = self._post_process_predict(y_pred=y_pred, as_pandas=as_pandas, index=X_index, inverse_transform=inverse_transform)
+        y_pred = get_pred_from_proba(
+            y_pred_proba=y_pred_proba, problem_type=problem_type, decision_threshold=decision_threshold
+        )
+        y_pred = self._post_process_predict(
+            y_pred=y_pred, as_pandas=as_pandas, index=X_index, inverse_transform=inverse_transform
+        )
         return y_pred
 
     def _post_process_predict(
@@ -235,11 +251,19 @@ class AbstractTabularLearner(AbstractLearner):
                 y_pred = y_pred.values
         else:
             if as_pandas:
+                if len(y_pred) == 0:
+                    # avoid exception due to mismatched shape for empty predict
+                    y_pred = None
                 y_pred = pd.DataFrame(data=y_pred, columns=self.quantile_levels, index=index)
         return y_pred
 
     def _post_process_predict_proba(
-        self, y_pred_proba: np.ndarray, as_pandas: bool = True, index=None, as_multiclass: bool = True, inverse_transform: bool = True
+        self,
+        y_pred_proba: np.ndarray,
+        as_pandas: bool = True,
+        index=None,
+        as_multiclass: bool = True,
+        inverse_transform: bool = True,
     ):
         """
         Given internal prediction probabilities, post-process them to vend to user.
@@ -266,6 +290,7 @@ class AbstractTabularLearner(AbstractLearner):
         as_multiclass: bool = True,
         transform_features: bool = True,
         inverse_transform: bool = True,
+        use_refit_parent_oof: bool = True,
     ) -> dict:
         """
         Returns a dictionary of prediction probabilities where the key is
@@ -301,6 +326,8 @@ class AbstractTabularLearner(AbstractLearner):
         inverse_transform : bool, default = True
             If True, will return prediction probabilities in the original format.
             If False (advanced), will return prediction probabilities in AutoGluon's internal format.
+        use_refit_parent_oof: bool = True
+            If True and data is None and returning OOF, will return the parent model's OOF for refit models instead of raising an exception.
 
         Returns
         -------
@@ -327,12 +354,16 @@ class AbstractTabularLearner(AbstractLearner):
                 X_index = copy.deepcopy(X.index) if as_pandas else None
                 predict_proba_dict = dict()
                 for m in models:
-                    predict_proba_dict[m] = trainer.get_model_oof(m)
+                    predict_proba_dict[m] = trainer.get_model_oof(m, use_refit_parent=use_refit_parent_oof)
 
         # Inverse Transform labels
         for m, pred_proba in predict_proba_dict.items():
             predict_proba_dict[m] = self._post_process_predict_proba(
-                y_pred_proba=pred_proba, as_pandas=as_pandas, as_multiclass=as_multiclass, index=X_index, inverse_transform=inverse_transform
+                y_pred_proba=pred_proba,
+                as_pandas=as_pandas,
+                as_multiclass=as_multiclass,
+                index=X_index,
+                inverse_transform=inverse_transform,
             )
         return predict_proba_dict
 
@@ -343,6 +374,7 @@ class AbstractTabularLearner(AbstractLearner):
         as_pandas: bool = True,
         transform_features: bool = True,
         inverse_transform: bool = True,
+        use_refit_parent_oof: bool = True,
         *,
         decision_threshold: float = None,
     ) -> dict:
@@ -350,31 +382,61 @@ class AbstractTabularLearner(AbstractLearner):
         Identical to predict_proba_multi, except returns predictions instead of probabilities.
         """
         predict_proba_dict = self.predict_proba_multi(
-            X=X, models=models, as_pandas=as_pandas, transform_features=transform_features, inverse_transform=inverse_transform
+            X=X,
+            models=models,
+            as_pandas=as_pandas,
+            transform_features=transform_features,
+            inverse_transform=inverse_transform,
+            use_refit_parent_oof=use_refit_parent_oof,
         )
+        if self.problem_type in [REGRESSION, QUANTILE]:
+            return predict_proba_dict
         predict_dict = {}
         for m in predict_proba_dict:
             predict_dict[m] = self.get_pred_from_proba(
-                y_pred_proba=predict_proba_dict[m], decision_threshold=decision_threshold, inverse_transform=inverse_transform
+                y_pred_proba=predict_proba_dict[m],
+                decision_threshold=decision_threshold,
+                inverse_transform=inverse_transform,
             )
         return predict_dict
 
     def get_pred_from_proba(
-        self, y_pred_proba: np.ndarray | pd.DataFrame, decision_threshold: float | None = None, inverse_transform: bool = True
+        self,
+        y_pred_proba: np.ndarray | pd.DataFrame,
+        decision_threshold: float | None = None,
+        inverse_transform: bool = True,
     ) -> np.array | pd.Series:
         if isinstance(y_pred_proba, pd.DataFrame):
-            y_pred = get_pred_from_proba_df(y_pred_proba, problem_type=self.problem_type, decision_threshold=decision_threshold)
+            y_pred = get_pred_from_proba_df(
+                y_pred_proba, problem_type=self.problem_type, decision_threshold=decision_threshold
+            )
         else:
-            y_pred = get_pred_from_proba(y_pred_proba, problem_type=self.problem_type, decision_threshold=decision_threshold)
-            y_pred = self._post_process_predict(y_pred=y_pred, as_pandas=False, index=None, inverse_transform=inverse_transform)
+            y_pred = get_pred_from_proba(
+                y_pred_proba, problem_type=self.problem_type, decision_threshold=decision_threshold
+            )
+            y_pred = self._post_process_predict(
+                y_pred=y_pred, as_pandas=False, index=None, inverse_transform=inverse_transform
+            )
         return y_pred
 
     def _validate_fit_input(self, X: DataFrame, **kwargs):
-        if self.label not in X.columns:
-            raise KeyError(f"Label column '{self.label}' is missing from training data. Training data columns: {list(X.columns)}")
+        self.validate_label(X=X)
         X_val = kwargs.get("X_val", None)
         self._validate_sample_weight(X, X_val)
         self._validate_groups(X, X_val)
+        X_test = kwargs.get("X_test", None)
+        if X_test is not None:
+            self._validate_sample_weight(X, X_test)
+            self._validate_groups(X, X_test)
+
+    def validate_label(self, X: DataFrame):
+        """
+        Ensure that the label column is present in the training data
+        """
+        if self.label not in X.columns:
+            raise KeyError(
+                f"Label column '{self.label}' is missing from training data. Training data columns: {list(X.columns)}"
+            )
 
     def _validate_sample_weight(self, X, X_val):
         if self.sample_weight is not None:
@@ -384,7 +446,9 @@ class AbstractTabularLearner(AbstractLearner):
                     prefix += " Warning: We do not recommend weight_evaluation=True with predefined sample weighting."
             else:
                 if self.sample_weight not in X.columns:
-                    raise KeyError(f"sample_weight column '{self.sample_weight}' is missing from training data. Training data columns: {list(X.columns)}")
+                    raise KeyError(
+                        f"sample_weight column '{self.sample_weight}' is missing from training data. Training data columns: {list(X.columns)}"
+                    )
                 weight_vals = X[self.sample_weight]
                 if weight_vals.isna().sum() > 0:
                     raise ValueError(f"Sample weights in column '{self.sample_weight}' cannot be nan")
@@ -393,8 +457,12 @@ class AbstractTabularLearner(AbstractLearner):
                 if weight_vals.min() < 0:
                     raise ValueError(f"Sample weights in column '{self.sample_weight}' must be nonnegative")
                 if self.weight_evaluation and X_val is not None and self.sample_weight not in X_val.columns:
-                    raise KeyError(f"sample_weight column '{self.sample_weight}' cannot be missing from validation data if weight_evaluation=True")
-                prefix = f"Values in column '{self.sample_weight}' used as sample weights instead of predictive features."
+                    raise KeyError(
+                        f"sample_weight column '{self.sample_weight}' cannot be missing from validation data if weight_evaluation=True"
+                    )
+                prefix = (
+                    f"Values in column '{self.sample_weight}' used as sample weights instead of predictive features."
+                )
             if self.weight_evaluation:
                 suffix = " Evaluation will report weighted metrics, so ensure same column exists in test data."
             else:
@@ -404,12 +472,18 @@ class AbstractTabularLearner(AbstractLearner):
     def _validate_groups(self, X, X_val):
         if self.groups is not None:
             if self.groups not in X.columns:
-                raise KeyError(f"groups column '{self.groups}' is missing from training data. Training data columns: {list(X.columns)}")
+                raise KeyError(
+                    f"groups column '{self.groups}' is missing from training data. Training data columns: {list(X.columns)}"
+                )
             groups_vals = X[self.groups]
             if len(groups_vals.unique()) < 2:
-                raise ValueError(f"Groups in column '{self.groups}' cannot have fewer than 2 unique values. Values: {list(groups_vals.unique())}")
+                raise ValueError(
+                    f"Groups in column '{self.groups}' cannot have fewer than 2 unique values. Values: {list(groups_vals.unique())}"
+                )
             if X_val is not None and self.groups in X_val.columns:
-                raise KeyError(f"groups column '{self.groups}' cannot be in validation data. Validation data columns: {list(X_val.columns)}")
+                raise KeyError(
+                    f"groups column '{self.groups}' cannot be in validation data. Validation data columns: {list(X_val.columns)}"
+                )
             logger.log(
                 20,
                 f"Values in column '{self.groups}' used as split folds instead of being automatically set. Bagged models will have {len(groups_vals.unique())} splits.",
@@ -464,25 +538,37 @@ class AbstractTabularLearner(AbstractLearner):
             X = feature_generator.transform(X)
         return X
 
-    def score(self, X: DataFrame, y=None, model=None):
+    def score(self, X: DataFrame, y=None, model: str = None, metric: Scorer = None, as_error: bool = False) -> float:
+        if metric is None:
+            metric = self.eval_metric
         if y is None:
             X, y = self.extract_label(X)
         self._validate_class_labels(y)
-        w = None
+        weights = None
         if self.weight_evaluation:
-            X, w = extract_column(X, self.sample_weight)
-        if self.eval_metric.needs_pred:
+            X, weights = extract_column(X, self.sample_weight)
+        if self.eval_metric.needs_pred or self.eval_metric.needs_quantile:
+            y_pred_proba = None
             y_pred = self.predict(X=X, model=model, as_pandas=False)
             if self.problem_type == BINARY:
                 # Use 1 and 0, otherwise f1 can crash due to unknown pos_label.
                 y_pred = self.label_cleaner.transform(y_pred)
                 y = self.label_cleaner.transform(y)
-        elif self.eval_metric.needs_quantile:
-            y_pred = self.predict(X=X, model=model, as_pandas=False)
         else:
-            y_pred = self.predict_proba(X=X, model=model, as_pandas=False, as_multiclass=False)
+            y_pred_proba = self.predict_proba(X=X, model=model, as_pandas=False, as_multiclass=False)
+            y_pred = None
             y = self.label_cleaner.transform(y)
-        return compute_weighted_metric(y, y_pred, self.eval_metric, w, weight_evaluation=self.weight_evaluation, quantile_levels=self.quantile_levels)
+
+        return compute_metric(
+            y=y,
+            y_pred=y_pred,
+            y_pred_proba=y_pred_proba,
+            metric=metric,
+            weights=weights,
+            weight_evaluation=self.weight_evaluation,
+            as_error=as_error,
+            quantile_levels=self.quantile_levels,
+        )
 
     # Scores both learner and all individual models, along with computing the optimal ensemble score + weights (oracle)
     def score_debug(
@@ -498,7 +584,12 @@ class AbstractTabularLearner(AbstractLearner):
         set_refit_score_to_parent=False,
         display=False,
     ):
-        leaderboard_df = self.leaderboard(extra_info=extra_info, refit_full=refit_full, set_refit_score_to_parent=set_refit_score_to_parent, display=display)
+        leaderboard_df = self.leaderboard(
+            extra_info=extra_info,
+            refit_full=refit_full,
+            set_refit_score_to_parent=set_refit_score_to_parent,
+            display=display,
+        )
         if extra_metrics is None:
             extra_metrics = []
         if y is None:
@@ -523,14 +614,21 @@ class AbstractTabularLearner(AbstractLearner):
         all_trained_models = [m for m in all_trained_models if m in leaderboard_models]
         all_trained_models_can_infer = trainer.get_model_names(models=all_trained_models, can_infer=True)
         all_trained_models_original = all_trained_models.copy()
-        model_pred_proba_dict, pred_time_test_marginal = trainer.get_model_pred_proba_dict(X=X, models=all_trained_models_can_infer, record_pred_time=True)
+        model_pred_proba_dict, pred_time_test_marginal = trainer.get_model_pred_proba_dict(
+            X=X, models=all_trained_models_can_infer, record_pred_time=True
+        )
 
         if compute_oracle:
             pred_probas = list(model_pred_proba_dict.values())
             ensemble_selection = EnsembleSelection(
-                ensemble_size=100, problem_type=trainer.problem_type, metric=self.eval_metric, quantile_levels=self.quantile_levels
+                ensemble_size=100,
+                problem_type=trainer.problem_type,
+                metric=self.eval_metric,
+                quantile_levels=self.quantile_levels,
             )
-            ensemble_selection.fit(predictions=pred_probas, labels=y_internal, identifiers=None, sample_weight=w)  # TODO: Only fit non-nan
+            ensemble_selection.fit(
+                predictions=pred_probas, labels=y_internal, identifiers=None, sample_weight=w
+            )  # TODO: Only fit non-nan
 
             oracle_weights = ensemble_selection.weights_
             oracle_pred_time_start = time.time()
@@ -548,15 +646,21 @@ class AbstractTabularLearner(AbstractLearner):
             if skip_score:
                 scores[model_name] = np.nan
             else:
-                scores[model_name] = self._score_with_pred_proba(
-                    y_pred_proba_internal=y_pred_proba_internal, metric=self.eval_metric, decision_threshold=decision_threshold, **scoring_args
+                scores[model_name] = self.score_with_pred_proba(
+                    y_pred_proba_internal=y_pred_proba_internal,
+                    metric=self.eval_metric,
+                    decision_threshold=decision_threshold,
+                    **scoring_args,
                 )
             for metric in extra_metrics:
                 metric = get_metric(metric, self.problem_type, "leaderboard_metric")
                 if metric.name not in extra_scores:
                     extra_scores[metric.name] = {}
-                extra_scores[metric.name][model_name] = self._score_with_pred_proba(
-                    y_pred_proba_internal=y_pred_proba_internal, metric=metric, decision_threshold=decision_threshold, **scoring_args
+                extra_scores[metric.name][model_name] = self.score_with_pred_proba(
+                    y_pred_proba_internal=y_pred_proba_internal,
+                    metric=metric,
+                    decision_threshold=decision_threshold,
+                    **scoring_args,
                 )
 
         if extra_scores:
@@ -593,8 +697,6 @@ class AbstractTabularLearner(AbstractLearner):
                 pred_time_test[model] = None
                 pred_time_test_marginal[model] = None
 
-        logger.debug("Model scores:")
-        logger.debug(str(scores))
         model_names_final = list(scores.keys())
         df = pd.DataFrame(
             data={
@@ -609,7 +711,8 @@ class AbstractTabularLearner(AbstractLearner):
 
         df_merged = pd.merge(df, leaderboard_df, on="model", how="left")
         df_merged = df_merged.sort_values(
-            by=["score_test", "pred_time_test", "score_val", "pred_time_val", "model"], ascending=[False, True, False, True, False]
+            by=["score_test", "pred_time_test", "score_val", "pred_time_val", "model"],
+            ascending=[False, True, False, True, False],
         ).reset_index(drop=True)
         df_columns_lst = df_merged.columns.tolist()
         explicit_order = [
@@ -637,27 +740,68 @@ class AbstractTabularLearner(AbstractLearner):
 
         return df_merged
 
-    def _score_with_pred_proba(self, y, y_internal, y_pred_proba_internal, metric, sample_weight=None, decision_threshold=None, weight_evaluation=None):
+    def score_with_pred_proba(
+        self,
+        y,
+        y_internal,
+        y_pred_proba_internal: np.ndarray,
+        metric: Scorer = None,
+        sample_weight: np.ndarray = None,
+        decision_threshold: float = None,
+        weight_evaluation: bool = None,
+        as_error: bool = False,
+    ) -> float:
+        if metric is None:
+            metric = self.eval_metric
         metric = get_metric(metric, self.problem_type, "leaderboard_metric")
         if weight_evaluation is None:
             weight_evaluation = self.weight_evaluation
-        if metric.needs_pred:
+        if metric.needs_pred or metric.needs_quantile:
             if self.problem_type == BINARY:
                 # Use 1 and 0, otherwise f1 can crash due to unknown pos_label.
-                y_pred = self.get_pred_from_proba(y_pred_proba_internal, decision_threshold=decision_threshold, inverse_transform=False)
+                y_pred = self.get_pred_from_proba(
+                    y_pred_proba_internal, decision_threshold=decision_threshold, inverse_transform=False
+                )
+                y_pred_proba = None
                 y_tmp = y_internal
             else:
                 y_pred = self.label_cleaner.inverse_transform_proba(y_pred_proba_internal, as_pred=True)
+                y_pred_proba = None
                 y_tmp = y
-        elif metric.needs_quantile:
-            y_pred = self.label_cleaner.inverse_transform_proba(y_pred_proba_internal, as_pred=True)
-            y_tmp = y
         else:
-            y_pred = self.label_cleaner.inverse_transform_proba(y_pred_proba_internal, as_pred=False)
-            y_tmp = y_internal
-        return compute_weighted_metric(y_tmp, y_pred, metric, weights=sample_weight, weight_evaluation=weight_evaluation, quantile_levels=self.quantile_levels)
+            y_pred = None
+            y_pred_proba = self.label_cleaner.inverse_transform_proba(y_pred_proba_internal, as_pred=False)
+            if isinstance(self.label_cleaner, LabelCleanerMulticlass):
+                # Ensures that logic works even when y contains previously dropped classes during fit.
+                # If y contains never before seen classes, this will raise a ValueError in `self._validate_class_labels`.
+                self._validate_class_labels(y=y, eval_metric=metric)
+                y_tmp = self.label_cleaner.transform_pred_uncleaned(y)
+            else:
+                y_tmp = y_internal
 
-    def _score_with_pred(self, y, y_internal, y_pred_internal, metric, sample_weight=None, weight_evaluation=None):
+        return compute_metric(
+            y=y_tmp,
+            y_pred=y_pred,
+            y_pred_proba=y_pred_proba,
+            metric=metric,
+            weights=sample_weight,
+            weight_evaluation=weight_evaluation,
+            as_error=as_error,
+            quantile_levels=self.quantile_levels,
+        )
+
+    def score_with_pred(
+        self,
+        y,
+        y_internal,
+        y_pred_internal,
+        metric: Scorer = None,
+        sample_weight: np.ndarray = None,
+        weight_evaluation: bool = None,
+        as_error: bool = False,
+    ) -> float:
+        if metric is None:
+            metric = self.eval_metric
         metric = get_metric(metric, self.problem_type, "leaderboard_metric")
         if weight_evaluation is None:
             weight_evaluation = self.weight_evaluation
@@ -668,13 +812,25 @@ class AbstractTabularLearner(AbstractLearner):
         else:
             y_pred = self.label_cleaner.inverse_transform(y_pred_internal)
             y_tmp = y
-        return compute_weighted_metric(y_tmp, y_pred, metric, weights=sample_weight, weight_evaluation=weight_evaluation, quantile_levels=self.quantile_levels)
 
-    def _validate_class_labels(self, y: Series):
+        return compute_metric(
+            y=y_tmp,
+            y_pred=y_pred,
+            y_pred_proba=None,
+            metric=metric,
+            weights=sample_weight,
+            weight_evaluation=weight_evaluation,
+            as_error=as_error,
+            quantile_levels=self.quantile_levels,
+        )
+
+    def _validate_class_labels(self, y: Series, eval_metric: Scorer = None):
         null_count = y.isnull().sum()
         if null_count:
             raise ValueError(f"Labels cannot contain missing (nan) values. Found {null_count} missing label values.")
-        if self.problem_type == MULTICLASS and not self.eval_metric.needs_pred:
+        if eval_metric is None:
+            eval_metric = self.eval_metric
+        if self.problem_type == MULTICLASS and not eval_metric.needs_pred:
             y_unique = np.unique(y)
             valid_class_set = set(self.class_labels)
             unknown_classes = []
@@ -684,10 +840,22 @@ class AbstractTabularLearner(AbstractLearner):
             if unknown_classes:
                 # log_loss / pac_score
                 raise ValueError(
-                    f"Multiclass scoring with eval_metric='{self.eval_metric.name}' does not support unknown classes. Unknown classes: {unknown_classes}"
+                    f"Multiclass scoring with eval_metric='{eval_metric.name}' does not support unknown classes. "
+                    f"Please ensure the classes you wish to evaluate are present in the training data, otherwise they cannot be scored with this metric."
+                    f"\n\tUnknown classes: {unknown_classes}"
+                    f"\n\t  Known classes: {self.class_labels}"
                 )
 
-    def evaluate_predictions(self, y_true, y_pred, sample_weight=None, decision_threshold=None, display=False, auxiliary_metrics=True, detailed_report=False):
+    def evaluate_predictions(
+        self,
+        y_true,
+        y_pred,
+        sample_weight=None,
+        decision_threshold=None,
+        display=False,
+        auxiliary_metrics=True,
+        detailed_report=False,
+    ):
         """Evaluate predictions. Does not support sample weights since this method reports a variety of metrics.
         Args:
             display (bool): Should we print which metric is being used as well as performance.
@@ -778,16 +946,21 @@ class AbstractTabularLearner(AbstractLearner):
             if isinstance(aux_metric, str):
                 aux_metric = get_metric(metric=aux_metric, problem_type=self.problem_type, metric_type="aux_metric")
             if not aux_metric.needs_pred and y_pred_proba_internal is None:
-                logger.log(15, f"Skipping {aux_metric.name} because no prediction probabilities are available to score.")
+                logger.log(
+                    15, f"Skipping {aux_metric.name} because no prediction probabilities are available to score."
+                )
                 continue
 
             if aux_metric.name not in performance_dict:
                 if y_pred_proba_internal is not None:
-                    score = self._score_with_pred_proba(
-                        y_pred_proba_internal=y_pred_proba_internal, metric=aux_metric, decision_threshold=decision_threshold, **scoring_args
+                    score = self.score_with_pred_proba(
+                        y_pred_proba_internal=y_pred_proba_internal,
+                        metric=aux_metric,
+                        decision_threshold=decision_threshold,
+                        **scoring_args,
                     )
                 else:
-                    score = self._score_with_pred(y_pred_internal=y_pred_internal, metric=aux_metric, **scoring_args)
+                    score = self.score_with_pred(y_pred_internal=y_pred_internal, metric=aux_metric, **scoring_args)
                 performance_dict[aux_metric.name] = score
 
         if display:
@@ -795,7 +968,10 @@ class AbstractTabularLearner(AbstractLearner):
                 score_eval = performance_dict[self.eval_metric.name]
                 logger.log(20, f"Evaluation: {self.eval_metric.name} on test data: {score_eval}")
                 if not self.eval_metric.greater_is_better_internal:
-                    logger.log(20, f"\tNote: Scores are always higher_is_better. This metric score can be multiplied by -1 to get the metric value.")
+                    logger.log(
+                        20,
+                        f"\tNote: Scores are always higher_is_better. This metric score can be multiplied by -1 to get the metric value.",
+                    )
             logger.log(20, "Evaluations on test data:")
             logger.log(20, json.dumps(performance_dict, indent=4))
 
@@ -861,7 +1037,9 @@ class AbstractTabularLearner(AbstractLearner):
             if extra_metrics:
                 raise AssertionError("`extra_metrics` is only valid when data is specified.")
             trainer = self.load_trainer()
-            leaderboard = trainer.leaderboard(extra_info=extra_info, refit_full=refit_full, set_refit_score_to_parent=set_refit_score_to_parent)
+            leaderboard = trainer.leaderboard(
+                extra_info=extra_info, refit_full=refit_full, set_refit_score_to_parent=set_refit_score_to_parent
+            )
         if only_pareto_frontier:
             if "score_test" in leaderboard.columns and "pred_time_test" in leaderboard.columns:
                 score_col = "score_test"
@@ -869,7 +1047,9 @@ class AbstractTabularLearner(AbstractLearner):
             else:
                 score_col = "score_val"
                 inference_time_col = "pred_time_val"
-            leaderboard = get_leaderboard_pareto_frontier(leaderboard=leaderboard, score_col=score_col, inference_time_col=inference_time_col)
+            leaderboard = get_leaderboard_pareto_frontier(
+                leaderboard=leaderboard, score_col=score_col, inference_time_col=inference_time_col
+            )
         if score_format == "error":
             leaderboard.rename(
                 columns={
@@ -898,7 +1078,15 @@ class AbstractTabularLearner(AbstractLearner):
     # features: list of feature names that feature importances are calculated for and returned, specify None to get all feature importances.
     # feature_stage: Whether to compute feature importance on raw original features ('original'), transformed features ('transformed') or on the features used by the particular model ('transformed_model').
     def get_feature_importance(
-        self, model=None, X=None, y=None, features: list = None, feature_stage="original", subsample_size=5000, silent=False, **kwargs
+        self,
+        model=None,
+        X=None,
+        y=None,
+        features: list = None,
+        feature_stage="original",
+        subsample_size=5000,
+        silent=False,
+        **kwargs,
     ) -> DataFrame:
         valid_feature_stages = ["original", "transformed", "transformed_model"]
         if feature_stage not in valid_feature_stages:
@@ -913,20 +1101,34 @@ class AbstractTabularLearner(AbstractLearner):
                 X = X.drop(columns=self.ignored_columns, errors="ignore")
             unused_features = [f for f in list(X.columns) if f not in self.features]
             if len(unused_features) > 0:
-                logger.log(30, f"These features in provided data are not utilized by the predictor and will be ignored: {unused_features}")
+                logger.log(
+                    30,
+                    f"These features in provided data are not utilized by the predictor and will be ignored: {unused_features}",
+                )
                 X = X.drop(columns=unused_features)
 
             if feature_stage == "original":
                 return trainer._get_feature_importance_raw(
-                    model=model, X=X, y=y, features=features, subsample_size=subsample_size, transform_func=self.transform_features, silent=silent, **kwargs
+                    model=model,
+                    X=X,
+                    y=y,
+                    features=features,
+                    subsample_size=subsample_size,
+                    transform_func=self.transform_features,
+                    silent=silent,
+                    **kwargs,
                 )
             X = self.transform_features(X)
         else:
             if feature_stage == "original":
-                raise AssertionError("Feature importance `dataset` cannot be None if `feature_stage=='original'`. A test dataset must be specified.")
+                raise AssertionError(
+                    "Feature importance `dataset` cannot be None if `feature_stage=='original'`. A test dataset must be specified."
+                )
             y = None
         raw = feature_stage == "transformed"
-        return trainer.get_feature_importance(X=X, y=y, model=model, features=features, raw=raw, subsample_size=subsample_size, silent=silent, **kwargs)
+        return trainer.get_feature_importance(
+            X=X, y=y, model=model, features=features, raw=raw, subsample_size=subsample_size, silent=silent, **kwargs
+        )
 
     @staticmethod
     def _remove_nan_label_rows(X, y):
@@ -939,7 +1141,9 @@ class AbstractTabularLearner(AbstractLearner):
         problem_type = self._infer_problem_type(y, silent=silent)
         if problem_type == QUANTILE:
             if self.quantile_levels is None:
-                raise AssertionError(f"problem_type is inferred to be {QUANTILE}, yet quantile_levels is not specified.")
+                raise AssertionError(
+                    f"problem_type is inferred to be {QUANTILE}, yet quantile_levels is not specified."
+                )
         elif self.quantile_levels is not None:
             if problem_type == REGRESSION:
                 problem_type = QUANTILE
@@ -983,7 +1187,11 @@ class AbstractTabularLearner(AbstractLearner):
     ):
         """See abstract_trainer.distill() for details."""
         if X is not None:
-            if (self.eval_metric is not None) and (self.eval_metric.name == "log_loss") and (self.problem_type == MULTICLASS):
+            if (
+                (self.eval_metric is not None)
+                and (self.eval_metric.name == "log_loss")
+                and (self.problem_type == MULTICLASS)
+            ):
                 X = augment_rare_classes(X, self.label, self.threshold)
             if y is None:
                 X, y = self.extract_label(X)
@@ -1072,6 +1280,12 @@ class AbstractTabularLearner(AbstractLearner):
             verbose=verbose,
             **kwargs,
         )
+
+    def _verify_metric(self, eval_metric: Scorer, problem_type: str):
+        """
+        Raises an exception if the eval_metric does not exist in the default metrics list for the problem type
+        """
+        get_metric(metric=eval_metric.name, problem_type=problem_type, metric_type="eval_metric")
 
     # TODO: Add data info gathering at beginning of .fit() that is used by all learners to add to get_info output
     # TODO: Add feature inference / feature engineering info to get_info output

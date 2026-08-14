@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import copy
 import inspect
 import logging
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Literal
 
+import pandas as pd
 from pandas import DataFrame, Series
 
 from autogluon.common.features.feature_metadata import FeatureMetadata
@@ -84,6 +87,11 @@ class AbstractFeatureGenerator:
         If infer_features_in_args is None, this is ignored.
     banned_feature_special_types : List[str], default None
         List of feature special types to additionally exclude from input. Will update self.get_default_infer_features_in_args().
+    target_type: str | None, default None
+        The problem type of the target variable, such as "binary", "multiclass", "regression".
+        If None and the preprocessor requires target_type, an exception will be raised.
+    random_state: int | None, default 0
+        The random state to use when fitting this generator.
     log_prefix : str, default ''
         Prefix string added to all logging statements made by the generator.
     verbosity : int, default 2
@@ -116,6 +124,9 @@ class AbstractFeatureGenerator:
         features_in: list = None,
         feature_metadata_in: FeatureMetadata = None,
         post_generators: list = None,
+        passthrough: bool = False,
+        passthrough_stage: Literal["first", "last"] = "first",  # FIXME: bug: "last" crashes if X_out is empty
+        passthrough_types: dict = None,
         pre_enforce_types=False,
         pre_drop_useless=False,
         post_drop_duplicates=False,
@@ -126,16 +137,26 @@ class AbstractFeatureGenerator:
         infer_features_in_args: dict = None,
         infer_features_in_args_strategy="overwrite",
         banned_feature_special_types: List[str] = None,
+        target_type: Literal["regression", "multiclass", "binary", None] = None,
+        random_state: int | None = 0,
         log_prefix="",
         verbosity=2,
     ):
         self._is_fit = False  # Whether the feature generator has been fit
         self.features_in = features_in  # Original features to use as input to feature generation
         self.features_out = None  # Final list of features after transformation
-        self.feature_metadata_in: FeatureMetadata = feature_metadata_in  # FeatureMetadata object based on the original input features.
+        self.feature_metadata_in: FeatureMetadata = (
+            feature_metadata_in  # FeatureMetadata object based on the original input features.
+        )
 
         # FeatureMetadata object based on the processed features. Pass to models to enable advanced functionality.
         self.feature_metadata: FeatureMetadata = None
+
+        self.passthrough = passthrough
+        self.passthrough_features = None
+        assert passthrough_stage in ["first", "last"]
+        self.passthrough_stage = passthrough_stage
+        self.passthrough_types = passthrough_types
 
         # TODO: Consider merging feature_metadata and feature_metadata_real, have FeatureMetadata contain exact dtypes, grouped raw dtypes,
         #  and special dtypes all at once.
@@ -150,7 +171,9 @@ class AbstractFeatureGenerator:
             elif infer_features_in_args_strategy == "update":
                 self._infer_features_in_args.update(infer_features_in_args)
             else:
-                raise ValueError(f"infer_features_in_args_strategy must be one of: {['overwrite', 'update']}, but was: '{infer_features_in_args_strategy}'")
+                raise ValueError(
+                    f"infer_features_in_args_strategy must be one of: {['overwrite', 'update']}, but was: '{infer_features_in_args_strategy}'"
+                )
         if banned_feature_special_types:
             if "invalid_special_types" not in self._infer_features_in_args:
                 self._infer_features_in_args["invalid_special_types"] = banned_feature_special_types
@@ -172,7 +195,9 @@ class AbstractFeatureGenerator:
             from .rename import RenameFeatureGenerator
 
             # inplace=False required to avoid altering outer context: refer to https://github.com/autogluon/autogluon/issues/2688
-            self._post_generators.append(RenameFeatureGenerator(name_prefix=name_prefix, name_suffix=name_suffix, inplace=False))
+            self._post_generators.append(
+                RenameFeatureGenerator(name_prefix=name_prefix, name_suffix=name_suffix, inplace=False)
+            )
 
         if self._post_generators:
             if not self.get_tags().get("allow_post_generators", True):
@@ -190,6 +215,8 @@ class AbstractFeatureGenerator:
 
         self._is_updated_name = False  # If feature names have been altered by name_prefix or name_suffix
 
+        self.target_type = target_type
+        self.random_state = random_state
         self.log_prefix = log_prefix
         self.verbosity = verbosity
 
@@ -211,7 +238,9 @@ class AbstractFeatureGenerator:
         """
         self.fit_transform(X, **kwargs)
 
-    def fit_transform(self, X: DataFrame, y: Series = None, feature_metadata_in: FeatureMetadata = None, **kwargs) -> DataFrame:
+    def fit_transform(
+        self, X: DataFrame, y: Series = None, feature_metadata_in: FeatureMetadata = None, **kwargs
+    ) -> DataFrame:
         """
         Fit generator to the provided data and return the transformed version of the data as if fit and transform were called sequentially with the same data.
         This is generally more efficient than calling fit and transform separately and can be up to twice as fast if the fit process requires transformation
@@ -271,7 +300,9 @@ class AbstractFeatureGenerator:
             from .astype import AsTypeFeatureGenerator
 
             self._pre_astype_generator = AsTypeFeatureGenerator(
-                features_in=self.features_in, feature_metadata_in=self.feature_metadata_in, log_prefix=self.log_prefix + "\t"
+                features_in=self.features_in,
+                feature_metadata_in=self.feature_metadata_in,
+                log_prefix=self.log_prefix + "\t",
             )
             self._pre_astype_generator.fit(X)
 
@@ -280,16 +311,37 @@ class AbstractFeatureGenerator:
         X_out, type_family_groups_special = self._fit_transform(X[self.features_in], y=y, **kwargs)
 
         type_map_raw = get_type_map_raw(X_out)
-        self._feature_metadata_before_post = FeatureMetadata(type_map_raw=type_map_raw, type_group_map_special=type_family_groups_special)
+        self.feature_metadata = FeatureMetadata(
+            type_map_raw=type_map_raw, type_group_map_special=type_family_groups_special
+        )
+
+        if self.passthrough and self.passthrough_stage == "first" and self.features_in:
+            self.feature_metadata, self.passthrough_features = self._fit_passthrough()
+            if self.passthrough_features:
+                X_out = self._transform_passthrough(X=X, X_out=X_out)
+
+        self._feature_metadata_before_post = self.feature_metadata
+
         if self._post_generators:
             X_out, self.feature_metadata, self._post_generators = self._fit_generators(
-                X=X_out, y=y, feature_metadata=self._feature_metadata_before_post, generators=self._post_generators, **kwargs
+                X=X_out,
+                y=y,
+                feature_metadata=self.feature_metadata,
+                generators=self._post_generators,
+                **kwargs,
             )
-        else:
-            self.feature_metadata = self._feature_metadata_before_post
+
+        # FIXME: This is bugged if `self.feature_metadata` is empty, crashes at transform
+        if self.passthrough and self.passthrough_stage == "last" and self.features_in:
+            self.feature_metadata, self.passthrough_features = self._fit_passthrough()
+            if self.passthrough_features:
+                X_out = self._transform_passthrough(X=X, X_out=X_out)
+
         type_map_real = get_type_map_real(X_out)
         self.features_out = list(X_out.columns)
-        self.feature_metadata_real = FeatureMetadata(type_map_raw=type_map_real, type_group_map_special=self.feature_metadata.get_type_group_map_raw())
+        self.feature_metadata_real = FeatureMetadata(
+            type_map_raw=type_map_real, type_group_map_special=self.feature_metadata.get_type_group_map_raw()
+        )
 
         self._post_fit_cleanup()
         if self.reset_index:
@@ -304,6 +356,30 @@ class AbstractFeatureGenerator:
             self.print_feature_metadata_info(log_level=15)
             self.print_generator_info(log_level=15)
         return X_out
+
+    def _fit_passthrough(self) -> tuple[FeatureMetadata, list[str]]:
+        if self.passthrough_types:
+            get_features_kwargs = self.passthrough_types
+        else:
+            get_features_kwargs = dict()
+        features_out_set = set(self.feature_metadata.get_features())
+        passthrough_features_unsorted = set(self.feature_metadata_in.get_features(**get_features_kwargs))
+        passthrough_features = [f for f in self.features_in if f in passthrough_features_unsorted]
+        passthrough_features = [f for f in passthrough_features if f not in features_out_set]
+        if passthrough_features:
+            passthrough_metadata = self.feature_metadata_in.keep_features(features=passthrough_features)
+            feature_metadata = self._merge_feature_metadata(
+                feature_metadata_lst=[
+                    passthrough_metadata,
+                    self.feature_metadata,
+                ],
+            )
+        else:
+            feature_metadata = self.feature_metadata
+        return feature_metadata, passthrough_features
+
+    def _transform_passthrough(self, X: DataFrame, X_out: DataFrame) -> DataFrame:
+        return self._concat_features(feature_df_list=[X[self.passthrough_features], X_out], index=X.index)
 
     def transform(self, X: DataFrame) -> DataFrame:
         """
@@ -349,8 +425,12 @@ class AbstractFeatureGenerator:
         if self._pre_astype_generator:
             X = self._pre_astype_generator.transform(X)
         X_out = self._transform(X)
+        if self.passthrough and self.passthrough_stage == "first" and self.passthrough_features:
+            X_out = self._transform_passthrough(X=X, X_out=X_out)
         if self._post_generators:
             X_out = self._transform_generators(X=X_out, generators=self._post_generators)
+        if self.passthrough and self.passthrough_stage == "last" and self.passthrough_features:
+            X_out = self._transform_passthrough(X=X, X_out=X_out)
         if self.reset_index:
             X_out.index = X_index
         return X_out
@@ -434,7 +514,8 @@ class AbstractFeatureGenerator:
         if self.feature_metadata_in is None:
             self._log(
                 20,
-                "\tInferring data type of each feature based on column values. Set feature_metadata_in to manually specify special " "dtypes of the features.",
+                "\tInferring data type of each feature based on column values. Set feature_metadata_in to manually specify special "
+                "dtypes of the features.",
             )
             self.feature_metadata_in = self._infer_feature_metadata_in(X=X)
         if self.features_in is None:
@@ -486,7 +567,30 @@ class AbstractFeatureGenerator:
     def get_default_infer_features_in_args() -> dict:
         raise NotImplementedError
 
-    def _fit_generators(self, X, y, feature_metadata, generators: list, **kwargs) -> (DataFrame, FeatureMetadata, list):
+    @staticmethod
+    def get_infer_features_in_args_to_drop() -> dict:
+        """Return a dict of kwargs for FeatureMetadata.get_features().
+
+        This allows to specify which features should be dropped after running this
+        feature generator in a feature generator group.
+
+         For example, assume you are using a feature generator to apply PCA to all
+         features of special type S_TEXT_EMBEDDING, then this function could return:
+            {
+                "invalid_special_types": [S_TEXT_EMBEDDING]
+            }
+        to inform the user that all S_TEXT_EMBEDDING features that are captured by PCA
+        should be dropped from the output of the feature generator group.
+        """
+        return {}
+
+    def estimate_output_feature_metadata(self, feature_metadata_in: FeatureMetadata, **kwargs) -> FeatureMetadata:
+        """Return an estimated representation of the feature metadata after fit_transform."""
+        raise NotImplementedError("This method is not implemented for this generator.")
+
+    def _fit_generators(
+        self, X, y, feature_metadata, generators: list["AbstractFeatureGenerator"], **kwargs
+    ) -> (DataFrame, FeatureMetadata, list):
         """
         Fit a list of AbstractFeatureGenerator objects in sequence, with the output of generators[i] fed as the input to generators[i+1]
         This is called to sequentially fit self._post_generators generators on the output of _fit_transform to obtain the final output of the generator.
@@ -500,7 +604,7 @@ class AbstractFeatureGenerator:
         return X, feature_metadata, generators
 
     @staticmethod
-    def _transform_generators(X, generators: list) -> DataFrame:
+    def _transform_generators(X, generators: list["AbstractFeatureGenerator"]) -> DataFrame:
         """
         Transforms X through a list of AbstractFeatureGenerator objects in sequence, with the output of generators[i] fed as the input to generators[i+1]
         This is called to sequentially transform self._post_generators generators on the output of _transform to obtain the final output of the generator.
@@ -509,6 +613,35 @@ class AbstractFeatureGenerator:
         for generator in generators:
             X = generator.transform(X=X)
         return X
+
+    @classmethod
+    def _merge_feature_metadata(
+        cls,
+        feature_metadata_lst: list[FeatureMetadata],
+        shared_raw_features: str = "error",
+    ) -> FeatureMetadata:
+        if not feature_metadata_lst:
+            return FeatureMetadata(type_map_raw=dict())
+        feature_metadata = FeatureMetadata.join_metadatas(
+            feature_metadata_lst,
+            shared_raw_features=shared_raw_features,
+        )
+        return feature_metadata
+
+    @classmethod
+    def _concat_features(cls, feature_df_list: list[DataFrame], index: pd.Index) -> DataFrame:
+        if not feature_df_list:
+            X = DataFrame(index=index)
+        elif len(feature_df_list) == 1:
+            X = feature_df_list[0]
+        else:
+            X = pd.concat(feature_df_list, axis=1, ignore_index=False, copy=False)
+        return X
+
+    def _keep_features_in(self, features: list):
+        features = set(features)
+        features_to_remove = [f for f in self.features_in if f not in features]
+        return self._remove_features_in(features=features_to_remove)
 
     def _remove_features_in(self, features: list):
         """
@@ -571,7 +704,9 @@ class AbstractFeatureGenerator:
             generated_features = set()
             for feature_in in feature_links_chain[i + 1]:
                 generated_features = generated_features.union(feature_links_chain[i + 1][feature_in])
-            features_out_to_remove = [feature for feature in generator.features_out if feature not in generated_features]
+            features_out_to_remove = [
+                feature for feature in generator.features_out if feature not in generated_features
+            ]
             generator._remove_features_out(features_out_to_remove)
 
     def _rename_features_in(self, column_rename_map: dict):
@@ -586,7 +721,9 @@ class AbstractFeatureGenerator:
         """
         if y is not None and isinstance(y, Series):
             if list(y.index) != list(X.index):
-                raise AssertionError(f"y.index and X.index must be equal when fitting {self.__class__.__name__}, but they differ.")
+                raise AssertionError(
+                    f"y.index and X.index must be equal when fitting {self.__class__.__name__}, but they differ."
+                )
 
     def _post_fit_cleanup(self):
         """
@@ -604,7 +741,9 @@ class AbstractFeatureGenerator:
             for column in count_dict:
                 if count_dict[column] > 1:
                     invalid_columns.append(column)
-            raise AssertionError(f"Columns appear multiple times in X. Columns must be unique. Invalid columns: {invalid_columns}")
+            raise AssertionError(
+                f"Columns appear multiple times in X. Columns must be unique. Invalid columns: {invalid_columns}"
+            )
 
     # TODO: Move to a generator
     @staticmethod
@@ -700,7 +839,9 @@ class AbstractFeatureGenerator:
             for feature in features_in:
                 feature_links_new[feature] = set()
                 for feature_out in feature_links[feature]:
-                    feature_links_new[feature] = feature_links_new[feature].union(feature_links_chain[i].get(feature_out, []))
+                    feature_links_new[feature] = feature_links_new[feature].union(
+                        feature_links_chain[i].get(feature_out, [])
+                    )
                 feature_links_new[feature] = list(feature_links_new[feature])
             feature_links = feature_links_new
         return feature_links
@@ -714,11 +855,15 @@ class AbstractFeatureGenerator:
                 else:
                     features_in = self._post_generators[i - 1].features_out
                 features_in_list.append(features_in)
-        return self._get_unused_features_generic(feature_links_chain=feature_links_chain, features_in_list=features_in_list)
+        return self._get_unused_features_generic(
+            feature_links_chain=feature_links_chain, features_in_list=features_in_list
+        )
 
     # TODO: Unit test this
     @staticmethod
-    def _get_unused_features_generic(feature_links_chain: List[Dict[str, List[str]]], features_in_list: List[List[str]]) -> List[List[str]]:
+    def _get_unused_features_generic(
+        feature_links_chain: List[Dict[str, List[str]]], features_in_list: List[List[str]]
+    ) -> List[List[str]]:
         unused_features = []
         unused_features_by_stage = []
         for i, chain in enumerate(reversed(feature_links_chain)):
@@ -748,7 +893,10 @@ class AbstractFeatureGenerator:
         """
         if self.fit_time:
             self._log(log_level, f"\t{round(self.fit_time, 1)}s = Fit runtime")
-            self._log(log_level, f"\t{len(self.features_in)} features in original data used to generate {len(self.features_out)} features in processed data.")
+            self._log(
+                log_level,
+                f"\t{len(self.features_in)} features in original data used to generate {len(self.features_out)} features in processed data.",
+            )
 
     def print_feature_metadata_info(self, log_level: int = 20):
         """
@@ -763,7 +911,9 @@ class AbstractFeatureGenerator:
         self.feature_metadata_in.print_feature_metadata_full(self.log_prefix + "\t\t", log_level=log_level)
         if self.feature_metadata_real:
             self._log(log_level - 5, "\tTypes of features in processed data (exact raw dtype, raw dtype):")
-            self.feature_metadata_real.print_feature_metadata_full(self.log_prefix + "\t\t", print_only_one_special=True, log_level=log_level - 5)
+            self.feature_metadata_real.print_feature_metadata_full(
+                self.log_prefix + "\t\t", print_only_one_special=True, log_level=log_level - 5
+            )
         self._log(log_level, "\tTypes of features in processed data (raw dtype, special dtypes):")
         self.feature_metadata.print_feature_metadata_full(self.log_prefix + "\t\t", log_level=log_level)
 
@@ -798,3 +948,23 @@ class AbstractFeatureGenerator:
                 more_tags = base_class._more_tags(self)
                 collected_tags.update(more_tags)
         return collected_tags
+
+
+# FIXME: this logic still needs more work to become general purpose.
+#   - Needs to make it work for multiple feature generator groups
+#   - Need to support for all possible feature generators
+def estimate_feature_metadata_after_generators(
+    *, feature_generators: list[list[AbstractFeatureGenerator]] | None, feature_metadata_in: FeatureMetadata, **kwargs
+) -> FeatureMetadata:
+    """Estimate the feature metadata after applying a set of feature generators."""
+    feature_metadata = copy.deepcopy(feature_metadata_in)
+    if feature_generators is not None:
+        for fg_group in feature_generators:
+            feature_metadatas = [
+                fg.estimate_output_feature_metadata(feature_metadata_in=feature_metadata, **kwargs) for fg in fg_group
+            ]
+            feature_metadata = FeatureMetadata.join_metadatas(
+                feature_metadatas,
+                shared_raw_features="error",
+            )
+    return feature_metadata

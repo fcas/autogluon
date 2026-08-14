@@ -19,8 +19,10 @@ class DuplicateFilter(object):
         dup_filter.clear_filter_targets() # nothing filtered anymore
     """
 
-    def __init__(self, filter_targets=[]):
+    def __init__(self, filter_targets=None):
         self.msgs = set()
+        if filter_targets is None:
+            filter_targets = []
         self.filter_targets = set(filter_targets)
 
     def filter(self, record):
@@ -30,7 +32,7 @@ class DuplicateFilter(object):
         return rv
 
     def attach_filter_targets(self, filter_targets):
-        if type(filter_targets) == str:
+        if isinstance(filter_targets, str):
             filter_targets = [filter_targets]
         for target in filter_targets:
             self.filter_targets.add(target)
@@ -110,6 +112,7 @@ def _add_stream_handler():
 
 
 __FIXED_KAGGLE_LOGGING = False
+__FIXED_SKLEARNEX_LOGGING = False
 
 
 def fix_logging_if_kaggle():
@@ -122,6 +125,23 @@ def fix_logging_if_kaggle():
         _add_stream_handler()
     # After the fix is performed, or it is determined we are not in Kaggle, no need to fix again.
     __FIXED_KAGGLE_LOGGING = True
+
+
+def fix_sklearnex_logging_if_kaggle():
+    """
+    Fixes logging verbosity for sklearnex when in a Kaggle notebook.
+    By default, sklearnex verbosity is set to `info` in Kaggle, which results in unintended logging spam.
+    This corrects this by detected if we are in a Kaggle environment and then setting the logger verbosity back to WARNING.
+
+    For more details, refer to the following:
+        1. https://github.com/intel/scikit-learn-intelex/issues/1695#issuecomment-1948647937
+        2. https://github.com/autogluon/autogluon/issues/4141
+    """
+    global __FIXED_SKLEARNEX_LOGGING
+    if (not __FIXED_SKLEARNEX_LOGGING) and _check_if_kaggle():
+        logging.getLogger("sklearnex").setLevel("WARNING")
+    # After the fix is performed, no need to fix again.
+    __FIXED_SKLEARNEX_LOGGING = True
 
 
 def convert_time_in_s_to_log_friendly(time_in_sec: float, min_value: float = 0.01):
@@ -154,3 +174,53 @@ def convert_time_in_s_to_log_friendly(time_in_sec: float, min_value: float = 0.0
         if time_adjusted >= min_value:
             break
     return time_adjusted, time_unit
+
+
+def reset_logger_for_remote_call(verbosity: int):
+    """Reset logger to the verbosity level set by the user for distributed training.
+
+    The remote functions will re-import the files of AutoGluon and thereby re-setting the logger to the default
+    level (warning). This function resets the logger to the verbosity level set by the user.
+    """
+    from autogluon.core.models.abstract.abstract_model import logger as abstract_model_logger
+    from autogluon.core.models.ensemble.bagged_ensemble_model import logger as bem_logger
+    from autogluon.core.models.ensemble.fold_fitting_strategy import logger as ffs_logger
+
+    set_logger_verbosity(verbosity=verbosity, logger=None)  # Default AutoGluon logger
+    set_logger_verbosity(verbosity=verbosity, logger=abstract_model_logger)
+    set_logger_verbosity(verbosity=verbosity, logger=ffs_logger)
+
+    # FIXME: move information from this (fitting strategy, how many folds, ...) to remote worker logger
+    # (or make these messages lvl 10)
+    # Limiting the verbosity of the BaggedEnsembleModel logger to 10 to avoid
+    # duplicated messages about fitting.
+    set_logger_verbosity(verbosity=min(verbosity, 1), logger=bem_logger)
+
+
+def warn_if_mlflow_autologging_is_enabled(logger: Optional[logging.Logger] = None):
+    """Log a warning if MLflow autologging is enabled.
+
+    MLflow autologging monkey-patches the sklearn metrics, which leads to a PicklingError when AutoGluon models
+    that have a metric as an instance attribute are saved to disk.
+
+    Related issues:
+        - https://github.com/mlflow/mlflow/issues/6268
+        - https://github.com/autogluon/autogluon/issues/4914
+    """
+    if logger is None:
+        logger = _logger_ag
+    try:
+        import mlflow
+
+        try:
+            if not mlflow.utils.autologging_utils.autologging_is_disabled("sklearn"):
+                logger.warning(
+                    "⚠️ Warning: MLflow autologging is enabled. This will likely break AutoGluon model training. "
+                    "Please disable autologging by executing `import mlflow; mlflow.autolog(disable=True)` before importing AutoGluon."
+                )
+        except Exception:
+            # gracefully handle cases where autologging_is_disabled is not available
+            pass
+    except Exception:
+        # mlflow not installed, all good
+        pass

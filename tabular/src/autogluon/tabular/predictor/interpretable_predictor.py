@@ -111,7 +111,7 @@ class InterpretableTabularPredictor(TabularPredictor):
 
         Parameters
         ----------
-        data : str or :class:`TabularDataset` or :class:`pd.DataFrame`
+        data : str or :class:`pd.DataFrame`
             The data to make predictions for. Should contain same column names as training Dataset and follow same format
             (may contain extra columns that won't be used by Predictor, including the label-column itself).
             If str is passed, `data` will be loaded using the str value as the file path.
@@ -135,5 +135,7 @@ class InterpretableTabularPredictor(TabularPredictor):
         labels = data[self.label]
         data_transformed = self.transform_features(data=data, model=model)
         labels_transformed = self.transform_labels(labels=labels)
-        cls, columns = imodels.explain_classification_errors(data_transformed, predictions, labels_transformed, print_rules=print_rules)
+        cls, columns = imodels.explain_classification_errors(
+            data_transformed, predictions, labels_transformed, print_rules=print_rules
+        )
         return cls

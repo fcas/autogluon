@@ -1,30 +1,31 @@
-""" Runs autogluon.tabular on synthetic classification and regression datasets.
-    We test various parameters to TabularPredictor() and fit()
-    We then check the leaderboard:
-       Did we run the expected list of models
-       Did each model have the expected score (within given range)
-       Did the ensembling produce the expected score (within given range)
-    This helps us spot any change in model performance.
-    If any changes are spotted, the script does its best to dump out new proposed score ranges
-    that you can cut and paste into the tests.  Only do this once you've identified the cause!
+"""Runs autogluon.tabular on synthetic classification and regression datasets.
+We test various parameters to TabularPredictor() and fit()
+We then check the leaderboard:
+   Did we run the expected list of models
+   Did each model have the expected score (within given range)
+   Did the ensembling produce the expected score (within given range)
+This helps us spot any change in model performance.
+If any changes are spotted, the script does its best to dump out new proposed score ranges
+that you can cut and paste into the tests.  Only do this once you've identified the cause!
 
-    Potential naming confusion: 
-        - this is a *regression* test, to make sure no functionality has accidentally got worse (testing terminology)
-        - it runs two types of TabularPredictor tests : *regression* and classification (ML terminology)
+Potential naming confusion:
+    - this is a *regression* test, to make sure no functionality has accidentally got worse (testing terminology)
+    - it runs two types of TabularPredictor tests : *regression* and classification (ML terminology)
 
-    These tests are designed to run fast, to permit them to be run on a github hook.
-    Currently the 11 tests, calling TabularPredictor.fit() 20 times, run in ~8 minutes on an 8 vcore machine with no GPU.
+These tests are designed to run fast, to permit them to be run on a github hook.
+Currently the 11 tests, calling TabularPredictor.fit() 20 times, run in ~8 minutes on an 8 vcore machine with no GPU.
 
-    Testing by @willsmithorg on master AG as of 2022-02-22 - 2022-02-23:
-    Tested on AWS Linux instance m5.2xlarge, amzn2-ami-kernel-5.10-hvm-2.0.20211223.0-x86_64-gp2 with 
-                                               (8  vcore, no GPU, Python==3.7.10, scikit-learn==1.0.2, torch==1.10.2), 
-    Tested on Github jenkins Linux:
-                                               (?  vcore,  0 GPU, Python==3.9.10, scikit-learn==1.0.2, torch==1.10.2), 
-    Tested on AWS Windows instance t3.xlarge, 
-                                               (4  vcore,  0 GPU, Python==3.9.7 , scikit-learn==1.0.2, torch==1.10.2), 
-                                               - Pytorch scores are slightly different, all else same.
+Testing by @willsmithorg on master AG as of 2022-02-22 - 2022-02-23:
+Tested on AWS Linux instance m5.2xlarge, amzn2-ami-kernel-5.10-hvm-2.0.20211223.0-x86_64-gp2 with
+                                           (8  vcore, no GPU, Python==3.7.10, scikit-learn==1.0.2, torch==1.10.2),
+Tested on Github jenkins Linux:
+                                           (?  vcore,  0 GPU, Python==3.9.10, scikit-learn==1.0.2, torch==1.10.2),
+Tested on AWS Windows instance t3.xlarge,
+                                           (4  vcore,  0 GPU, Python==3.9.7 , scikit-learn==1.0.2, torch==1.10.2),
+                                           - Pytorch scores are slightly different, all else same.
 
 """
+
 import hashlib
 import math
 import sys
@@ -63,7 +64,9 @@ def inner_test_tabular(testname):
     current_hash = hashlib.sha256(dftrain.round(decimals=3).values.tobytes()).hexdigest()[0:10]
     proposedconfig = "Proposed new config:\n"
     proposedconfig += f"'dataset_hash' : '{current_hash}',"
-    assert current_hash == test["dataset_hash"], f"Test '{testname}' input dataset has changed.  All scores will change.\n" + proposedconfig
+    assert current_hash == test["dataset_hash"], (
+        f"Test '{testname}' input dataset has changed.  All scores will change.\n" + proposedconfig
+    )
 
     # Now run the Predictor 1 or more times with various parameters, and make sure we get
     # back the expected results.
@@ -92,7 +95,9 @@ def inner_test_tabular(testname):
                     currentprecision = test["expected_score_range"][model][1]
                 else:
                     currentprecision = 0.01
-                values = "{}, {}".format(myfloor(leaderboard["score_test"][midx_in_leaderboard], currentprecision), currentprecision)
+                values = "{}, {}".format(
+                    myfloor(leaderboard["score_test"][midx_in_leaderboard], currentprecision), currentprecision
+                )
             proposedconfig += f"    '{model}': ({values}),\n"
         proposedconfig += "},\n"
 
@@ -117,16 +122,19 @@ def inner_test_tabular(testname):
             else:
                 values = "{}, {}".format(expectedmin, expectedrange)
 
-            if ((leaderboard["score_test"][midx_in_leaderboard] >= expectedmin) and (leaderboard["score_test"][midx_in_leaderboard] <= expectedmax)) or (
-                np.isnan(leaderboard["score_test"][midx_in_leaderboard]) and np.isnan(expectedmin)
-            ):
+            if (
+                (leaderboard["score_test"][midx_in_leaderboard] >= expectedmin)
+                and (leaderboard["score_test"][midx_in_leaderboard] <= expectedmax)
+            ) or (np.isnan(leaderboard["score_test"][midx_in_leaderboard]) and np.isnan(expectedmin)):
                 currentconfig += f"    '{model}': ({values}),\n"
             else:
                 currentconfig += f"    '{model}': ({values}), # <--- not met, got {leaderboard['score_test'][midx_in_leaderboard]} \n"
                 all_assertions_met = False
         currentconfig += "},\n"
 
-        assert all_assertions_met, f"Test '{testname}', params {params} had unexpected scores:\n" + currentconfig + proposedconfig
+        assert all_assertions_met, (
+            f"Test '{testname}', params {params} had unexpected scores:\n" + currentconfig + proposedconfig
+        )
 
         # Clean up this model created with specific params.
         predictor.delete_models(models_to_keep=[], dry_run=False)
@@ -150,7 +158,6 @@ def inner_test_tabular(testname):
         "small classification boolean",
     ],
 )
-
 # These results have only been confirmed for Linux.  Windows is known to give different results for Pytorch.
 @pytest.mark.skipif(sys.platform != "linux", reason="Scores only confirmed on Linux")
 @pytest.mark.regression

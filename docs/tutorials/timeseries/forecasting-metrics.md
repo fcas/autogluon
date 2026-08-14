@@ -43,9 +43,11 @@ Currently, AutoGluon supports following evaluation metrics:
 .. autosummary::
    :nosignatures:
 
+   MQL
    SQL
    WQL
    MAE
+   MAEB
    MAPE
    MASE
    MSE
@@ -54,8 +56,9 @@ Currently, AutoGluon supports following evaluation metrics:
    RMSSE
    SMAPE
    WAPE
+   WAPEB
 
-``` 
+```
 Alternatively, you can [define a custom forecast evaluation metric](#custom-forecast-metrics).
 
 ## Which evaluation metric to choose?
@@ -64,7 +67,7 @@ If you are not sure which evaluation metric to pick, here are three questions th
 
 **1. Are you interested in a point forecast or a probabilistic forecast?**
 
-If your goal is to generate an accurate **probabilistic** forecast, you should use `WQL` or `SQL` metrics.
+If your goal is to generate an accurate **probabilistic** forecast, you should use `WQL`, `MQL` or `SQL` metrics.
 These metrics are based on the [quantile loss](https://en.wikipedia.org/wiki/Quantile_regression) and measure the accuracy of the quantile forecasts.
 By default, AutoGluon predicts quantile levels `[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]`.
 To predict a different set of quantiles, you can use `quantile_levels` argument:
@@ -73,12 +76,14 @@ predictor = TimeSeriesPredictor(eval_metric="WQL", quantile_levels=[0.1, 0.5, 0.
 ```
 
 All remaining forecast metrics described on this page are **point** forecast metrics.
-Note that if you select the `eval_metric` to a point forecast metric when creating the `TimeSeriesPredictor`, then the forecast minimizing this metric will always be provided in the `"mean"` column of the predictions data frame.
+Note that if you select the `eval_metric` to a point forecast metric when creating the `TimeSeriesPredictor`, then the forecast minimizing this metric will always be provided in the `"mean"` column of the predictions dataframe.
 
 **2. Do you care more about accurately predicting time series with large values?**
 
-If the answer is "yes" (for example, if it's important to more accurately predict sales of popular products), you should use **scale-dependent** metrics like `WQL`, `MAE`, `RMSE`, or `WAPE`.
+If the answer is "yes" (for example, if it's important to more accurately predict sales of popular products), you should use **scale-dependent** metrics like `WQL`, `MQL`, `MAE`, `RMSE`, or `WAPE`.
 These metrics are also well-suited for dealing with sparse (intermittent) time series that have lots of zeros.
+If you additionally want to penalize forecasts that are systematically biased (consistently over- or under-forecasting demand), consider the bias-penalized metrics `MAEB` or `WAPEB`.
+To *measure* (rather than penalize) the direction and magnitude of the forecast bias, you can evaluate a trained predictor with the `BIAS` metric via `predictor.evaluate(..., metrics="BIAS")`. Since a low `BIAS` value can be achieved by a poor forecast (both over- and under-forecasting are penalized only in absolute terms), `BIAS` cannot be used as an `eval_metric` for model selection.
 
 If the answer is "no" (you care equally about all time series in the dataset), consider **scaled** metrics like `SQL`, `MASE` and `RMSSE`. Alternatively, **percentage-based** metrics `MAPE` and `SMAPE` can also be used to equalize the scale across time series. However, these percentage-based metrics have some [well-documented limitations](https://robjhyndman.com/publications/another-look-at-measures-of-forecast-accuracy/), so we don't recommend using them in practice.
 Note that both scaled and percentage-based metrics are poorly suited for sparse (intermittent) data.
@@ -87,6 +92,7 @@ Note that both scaled and percentage-based metrics are poorly suited for sparse 
 
 To estimate the **median**, you need to use metrics such as `MAE`, `MASE` or `WAPE`.
 If your goal is to predict the **mean** (expected value), you should use `MSE`, `RMSE` or `RMSSE` metrics.
+When dealing with intermittent or sparse time series, you can use the bias-penalized metrics `MAEB` and `WAPEB`. These balance between a median-seeking accuracy term and a mean-seeking bias penalty, which discourages the chronic under-forecasting that minimizing `MAE` or `WAPE` alone tends to reward.
 
 
 
@@ -101,50 +107,62 @@ If your goal is to predict the **mean** (expected value), you should use `MSE`, 
      - Probabilistic?
      - Scale-dependent?
      - Predicts median or mean?
-   * - :class:`~autogluon.timeseries.metrics.SQL` 
-     - ✅
-     -  
-     -  
-   * - :class:`~autogluon.timeseries.metrics.WQL` 
+   * - :class:`~autogluon.timeseries.metrics.MQL`
      - ✅
      - ✅
-     - 
+     -
+   * - :class:`~autogluon.timeseries.metrics.SQL`
+     - ✅
+     -
+     -
+   * - :class:`~autogluon.timeseries.metrics.WQL`
+     - ✅
+     - ✅
+     -
    * - :class:`~autogluon.timeseries.metrics.MAE`
-     - 
+     -
      - ✅
      - median
-   * - :class:`~autogluon.timeseries.metrics.MASE` 
-     - 
-     - 
+   * - :class:`~autogluon.timeseries.metrics.MAEB`
+     -
+     - ✅
+     -
+   * - :class:`~autogluon.timeseries.metrics.MASE`
+     -
+     -
      - median
    * - :class:`~autogluon.timeseries.metrics.WAPE`
-     - 
+     -
      - ✅
      - median
+   * - :class:`~autogluon.timeseries.metrics.WAPEB`
+     -
+     - ✅
+     -
    * - :class:`~autogluon.timeseries.metrics.MSE`
-     - 
+     -
      - ✅
      - mean
    * - :class:`~autogluon.timeseries.metrics.RMSE`
-     - 
+     -
      - ✅
      - mean
    * - :class:`~autogluon.timeseries.metrics.RMSLE`
-     - 
-     - 
+     -
+     -
      -
    * - :class:`~autogluon.timeseries.metrics.RMSSE`
-     - 
-     - 
+     -
+     -
      - mean
    * - :class:`~autogluon.timeseries.metrics.MAPE`
-     - 
-     - 
-     - 
-   * - :class:`~autogluon.timeseries.metrics.SMAPE` 
-     - 
-     - 
-     - 
+     -
+     -
+     -
+   * - :class:`~autogluon.timeseries.metrics.SMAPE`
+     -
+     -
+     -
 ```
 
 
@@ -161,6 +179,10 @@ We use the following notation in mathematical definitions of point forecast metr
 
 ```{eval-rst}
 .. autoclass:: MAE
+```
+
+```{eval-rst}
+.. autoclass:: MAEB
 ```
 
 ```{eval-rst}
@@ -195,6 +217,14 @@ We use the following notation in mathematical definitions of point forecast metr
 .. autoclass:: WAPE
 ```
 
+```{eval-rst}
+.. autoclass:: WAPEB
+```
+
+```{eval-rst}
+.. autoclass:: BIAS
+```
+
 
 ## Probabilistic forecast metrics
 In addition to the notation listed above, we use following notation to define probabilistic forecast metrics:
@@ -210,6 +240,10 @@ $$
 $$
 
 
+
+```{eval-rst}
+.. autoclass:: MQL
+```
 
 ```{eval-rst}
 .. autoclass:: SQL
@@ -268,11 +302,10 @@ train_data, test_data = data.train_test_split(prediction_length=prediction_lengt
 predictor = TimeSeriesPredictor(prediction_length=prediction_length, verbosity=0).fit(train_data, hyperparameters={"Naive": {}})
 predictions = predictor.predict(train_data)
 
-mse = MeanSquaredError()
+mse = MeanSquaredError(prediction_length=predictor.prediction_length)
 mse_score = mse(
   data=test_data,
   predictions=predictions,
-  prediction_length=predictor.prediction_length,
   target=predictor.target,
 )
 print(f"{mse.name_with_sign} = {mse_score}")
@@ -317,8 +350,8 @@ class MeanQuantileLoss(TimeSeriesScorer):
       return total_quantile_loss / len(quantile_columns)
 ```
 Here we set `needs_quantile=True` to tell AutoGluon that this metric is evaluated on the quantile forecasts.
-In this case, models such as {py:class}`~autogluon.timeseries.models.DirectTabularModel` will train a {py:class}`~autogluon.tabular.TabularPredictor` with `problem_type="quantile"` under the hood.
-If `needs_quantile=False`, these models would use `problem_type="regression"` instead.
+In this case, models such as {py:class}`~autogluon.timeseries.models.DirectTabularModel` will train a regression model from `autogluon.tabular` with `problem_type="quantile"` under the hood.
+If `needs_quantile=False`, these models will use `problem_type="regression"` instead.
 
 ### Custom mean absolute scaled error metric
 Finally, here is how we can define the [mean absolute scaled error (MASE) metric](https://otexts.com/fpp3/accuracy.html#scaled-errors).
@@ -340,7 +373,7 @@ class MeanAbsoluteScaledError(TimeSeriesScorer):
 
   def clear_past_metrics(self):
       self._abs_seasonal_error_per_item = None
-  
+
   def compute_metric(
       self, data_future: TimeSeriesDataFrame, predictions: TimeSeriesDataFrame, target: str = "target", **kwargs
   ) -> float:
@@ -352,7 +385,7 @@ Doing this in a separate method allows AutoGluon to avoid redundant computations
 
 Because we set `optimized_by_median=True`, AutoGluon will automatically paste the median forecast into the `"mean"` column of predictions.
 This is done for consistency: if `TimeSeriesPredictor` is trained with a point forecast metric, the optimal point forecast will always be stored in the `"mean"` column.
-Finally, the `equivalent_tabular_regression_metric` is used by forecasting models that fit {py:class}`~autogluon.tabular.TabularPredictor` under the hood.
+Finally, the `equivalent_tabular_regression_metric` is used by forecasting models that fit tabular regression models from `autogluon.tabular` under the hood.
 
 
 ### Using custom metrics in TimeSeriesPredictor
@@ -374,3 +407,46 @@ You can have a look at the AutoGluon source code for example implementations of 
 If you create a custom metric, consider [submitting a PR](https://github.com/autogluon/autogluon/pulls) so that we can officially add it to AutoGluon.
 
 For more tutorials, refer to [Forecasting Time Series - Quick Start](forecasting-quick-start.ipynb) and [Forecasting Time Series - In Depth](forecasting-indepth.ipynb).
+
+
+## Customizing the training loss for individual models
+While `eval_metric` is used for model selection and weighted ensemble construction, it usually has no effect on the training loss of the individual forecasting models.
+
+In some models such as `AutoETS` or `AutoARIMA`, the training loss is fixed and cannot be changed.
+In contrast, for GluonTS-based deep learning models the training loss can be changed by modifying the `distr_output` [hyperparameter](forecasting-model-zoo.md#deep-learning-models).
+By default, most GluonTS models set the `distr_output` to the heavy‑tailed `StudentTOutput` distribution for increased robustness to outliers.
+
+You can replace the default `StudentTOutput` with any built‑in `Output` from the [`gluonts.torch.distributions`](https://ts.gluon.ai/stable/api/gluonts/gluonts.torch.distributions.html) module.
+For example, here we train two versions of PatchTST with different outputs and losses:
+- `NormalOutput` - the model outputs parameters of a Gaussian distribution and trains with the negative log-likelihood loss.
+- `QuantileOutput` - the model outputs a quantile forecast and trains with the quantile loss.
+
+```python
+from autogluon.timeseries import TimeSeriesPredictor
+from gluonts.torch.distributions import NormalOutput, QuantileOutput
+
+predictor = TimeSeriesPredictor(...)
+predictor.fit(
+    train_data,
+    hyperparameters={
+        "PatchTST": [
+            {"distr_output": NormalOutput()},
+            {"distr_output": QuantileOutput(quantiles=predictor.quantile_levels)},
+        ]
+    }
+)
+```
+
+You can define a custom loss function for the GluonTS models by defining a subclass of [`gluonts.torch.distributions.Output`](https://github.com/awslabs/gluonts/blob/dev/src/gluonts/torch/distributions/output.py)
+and providing it as a `distr_output` to the model.
+
+```python
+from gluonts.torch.distributions import Output
+
+class MyCustomOutput(Output):
+    # implement methods of gluonts.torch.distributions.Output
+    ...
+
+predictor.fit(train_data, hyperparameters={"PatchTST": {"distr_output": MyCustomOutput()}})
+```
+You can find examples of `Output` implementations in the GluonTS code base (e.g., [`QuantileOutput`](https://github.com/awslabs/gluonts/blob/dev/src/gluonts/torch/distributions/quantile_output.py) or [`NormalOutput`](https://github.com/awslabs/gluonts/blob/dev/src/gluonts/torch/distributions/distribution_output.py)).

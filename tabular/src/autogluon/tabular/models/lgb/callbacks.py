@@ -7,7 +7,6 @@ from operator import gt, lt
 
 from lightgbm.callback import EarlyStopException, _format_eval_result
 
-from autogluon.common.utils.lite import disable_if_lite_mode
 from autogluon.common.utils.resource_utils import ResourceManager
 from autogluon.core.utils.early_stopping import SimpleES
 
@@ -74,12 +73,15 @@ def early_stopping_custom(
 
     def _init(env):
         if not ignore_dart_warning:
-            enabled[0] = not any((boost_alias in env.params and env.params[boost_alias] == "dart") for boost_alias in ("boosting", "boosting_type", "boost"))
+            enabled[0] = not any(
+                (boost_alias in env.params and env.params[boost_alias] == "dart")
+                for boost_alias in ("boosting", "boosting_type", "boost")
+            )
         if not enabled[0]:
             warnings.warn("Early stopping is not available in dart mode")
             return
         if not env.evaluation_result_list:
-            raise ValueError("For early stopping, " "at least one dataset and eval metric is required for evaluation")
+            raise ValueError("For early stopping, at least one dataset and eval metric is required for evaluation")
 
         if verbose:
             msg = "Training until validation scores don't improve for {} rounds."
@@ -116,14 +118,12 @@ def early_stopping_custom(
                     if first_metric_only:
                         break
 
-        @disable_if_lite_mode()
         def _init_mem():
             init_mem_rss.append(mem_status.memory_info().rss)
             init_mem_avail.append(ResourceManager.get_available_virtual_mem())
 
         _init_mem()
 
-    @disable_if_lite_mode()
     def _mem_early_stop():
         available = ResourceManager.get_available_virtual_mem()
         cur_rss = mem_status.memory_info().rss
@@ -133,13 +133,23 @@ def early_stopping_custom(
         estimated_model_size_mb = (cur_rss - init_mem_rss[0]) >> 20
         available_mb = available >> 20
 
-        model_size_memory_ratio = estimated_model_size_mb / available_mb
+        if available_mb != 0:
+            model_size_memory_ratio = estimated_model_size_mb / available_mb
+        else:
+            model_size_memory_ratio = 100
+
         if verbose or (model_size_memory_ratio > 0.25):
             logger.debug("Available Memory: " + str(available_mb) + " MB")
             logger.debug("Estimated Model Size: " + str(estimated_model_size_mb) + " MB")
 
         early_stop = False
-        if model_size_memory_ratio > 1.0:
+        # FIXME: during parallel fits, model only knows its own memory usage and the overall system memory.
+        #  Because memory usage can spike during saving, OOM can occur if many models finish at the same time and spike in memory at the same time during save.
+        #  To fix this, we need to provide the per-model memory limit as a constraint passed to this method,
+        #  so that we can ensure a given model isn't exceeding its portion of the memory budget.
+        #  Ditto for XGBoost and CatBoost (ex: "kropt" dataset with 8-fold bagging and 32 GB memory. Fits 10k iterations on all 8 folds, then goes OOM)
+        #  We also need to estimate the peak memory usage given the estimated_model_size_mb if we were to save. Otherwise we will go OOM during save anyways.
+        if model_size_memory_ratio > 0.66:
             logger.warning("Warning: Large GBM model size may cause OOM error if training continues")
             logger.warning("Available Memory: " + str(available_mb) + " MB")
             logger.warning("Estimated GBM model size: " + str(estimated_model_size_mb) + " MB")
@@ -169,7 +179,9 @@ def early_stopping_custom(
         if not enabled[0]:
             return
         if train_loss_name is not None:
-            train_loss_evals = [eval for eval in env.evaluation_result_list if eval[0] == "train_set" and eval[1] == train_loss_name]
+            train_loss_evals = [
+                eval for eval in env.evaluation_result_list if eval[0] == "train_set" and eval[1] == train_loss_name
+            ]
             train_loss_val = train_loss_evals[0][2]
         else:
             train_loss_val = 0.0
@@ -184,7 +196,9 @@ def early_stopping_custom(
                 best_score_list[i] = env.evaluation_result_list
                 best_trainloss[i] = train_loss_val
             if reporter is not None:  # Report current best scores for iteration, used in HPO
-                if i == indices_to_check[0]:  # TODO: documentation needs to note that we assume 0th index is the 'official' validation performance metric.
+                if (
+                    i == indices_to_check[0]
+                ):  # TODO: documentation needs to note that we assume 0th index is the 'official' validation performance metric.
                     if cmp_op[i] == gt:
                         validation_perf = score
                     else:
@@ -204,7 +218,10 @@ def early_stopping_custom(
                     logger.log(
                         15,
                         "Early stopping, best iteration is:\n[%d]\t%s"
-                        % (best_iter[i] + 1, "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]])),
+                        % (
+                            best_iter[i] + 1,
+                            "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]]),
+                        ),
                     )
                 raise EarlyStopException(best_iter[i], best_score_list[i])
             elif (max_diff is not None) and (abs(score - best_score[i]) > max_diff):
@@ -214,7 +231,10 @@ def early_stopping_custom(
                     logger.log(
                         15,
                         "Early stopping, best iteration is:\n[%d]\t%s"
-                        % (best_iter[i] + 1, "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]])),
+                        % (
+                            best_iter[i] + 1,
+                            "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]]),
+                        ),
                     )
                 raise EarlyStopException(best_iter[i], best_score_list[i])
             if env.iteration == env.end_iteration - 1:
@@ -222,7 +242,10 @@ def early_stopping_custom(
                     logger.log(
                         15,
                         "Did not meet early stopping criterion. Best iteration is:\n[%d]\t%s"
-                        % (best_iter[i] + 1, "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]])),
+                        % (
+                            best_iter[i] + 1,
+                            "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]]),
+                        ),
                     )
                 raise EarlyStopException(best_iter[i], best_score_list[i])
             if verbose:
@@ -233,7 +256,10 @@ def early_stopping_custom(
                 logger.log(
                     20,
                     "Found manual stop file, early stopping. Best iteration is:\n[%d]\t%s"
-                    % (best_iter[i] + 1, "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]])),
+                    % (
+                        best_iter[i] + 1,
+                        "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]]),
+                    ),
                 )
                 raise EarlyStopException(best_iter[i], best_score_list[i])
         if time_limit:
@@ -245,7 +271,11 @@ def early_stopping_custom(
                     20,
                     "\tRan out of time, early stopping on iteration "
                     + str(env.iteration + 1)
-                    + ". Best iteration is:\n\t[%d]\t%s" % (best_iter[i] + 1, "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]])),
+                    + ". Best iteration is:\n\t[%d]\t%s"
+                    % (
+                        best_iter[i] + 1,
+                        "\t".join([_format_eval_result(x, show_stdv=False) for x in best_score_list[i]]),
+                    ),
                 )
                 raise EarlyStopException(best_iter[i], best_score_list[i])
 

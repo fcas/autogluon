@@ -1,44 +1,32 @@
 import logging
 import random
-import warnings
-from io import BytesIO
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 import PIL
 import torch
-from omegaconf import DictConfig
 from PIL import Image, ImageFile
 from torch import nn
 from torchvision import transforms
-
-from .utils import construct_image_processor, image_mean_std
-
-try:
-    from torchvision.transforms import InterpolationMode
-
-    BICUBIC = InterpolationMode.BICUBIC
-except ImportError:
-    BICUBIC = PIL.Image.BICUBIC
 
 from ..constants import (
     CLASS_LABEL,
     COLUMN,
     IMAGE,
-    IMAGE_BYTEARRAY,
     IMAGE_VALID_NUM,
     LABEL,
     MASK_LABEL,
     SEMANTIC_SEGMENTATION_GT,
     SEMANTIC_SEGMENTATION_IMG,
 )
-from .collator import ListCollator, PadCollator, StackCollator
+from .collator import ListCollator, PadCollator
+from .process_image import ImageProcessor
 
 logger = logging.getLogger(__name__)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-class SemanticSegImageProcessor:
+class SemanticSegImageProcessor(ImageProcessor):
     """
     Prepare image data for the model specified by "prefix". For multiple models requiring image data,
     we need to create a ImageProcessor for each related model so that they will have independent input.
@@ -51,7 +39,6 @@ class SemanticSegImageProcessor:
         gt_transforms: List[str],
         train_transforms: Optional[List[str]] = None,
         val_transforms: Optional[List[str]] = None,
-        norm_type: Optional[str] = None,
         max_img_num_per_col: Optional[int] = 1,
         missing_value_strategy: Optional[str] = "skip",
         requires_column_info: bool = False,
@@ -70,15 +57,6 @@ class SemanticSegImageProcessor:
             A list of image transforms used in training for data augmentation. Note that the transform order matters.
         val_transforms
             A list of image transforms used in validation/test/prediction. Note that the transform order matters.
-        norm_type
-            How to normalize an image. We now support:
-            - inception
-                Normalize image by IMAGENET_INCEPTION_MEAN and IMAGENET_INCEPTION_STD from timm
-            - imagenet
-                Normalize image by IMAGENET_DEFAULT_MEAN and IMAGENET_DEFAULT_STD from timm
-            - clip
-                Normalize image by mean (0.48145466, 0.4578275, 0.40821073) and
-                std (0.26862954, 0.26130258, 0.27577711), used for CLIP.
         max_img_num_per_col
             The maximum number of images one sample can have.
         missing_value_strategy
@@ -98,7 +76,8 @@ class SemanticSegImageProcessor:
         self.requires_column_info = requires_column_info
 
         self.size = model.image_size
-        self.mean, self.std = image_mean_std(norm_type)
+        self.mean = model.image_mean
+        self.std = model.image_std
         self.normalization = transforms.Normalize(self.mean, self.std)
         self.num_classes = model.num_classes
         self.ignore_label = ignore_label
@@ -110,10 +89,10 @@ class SemanticSegImageProcessor:
         self.max_img_num_per_col = max_img_num_per_col
         logger.debug(f"max_img_num_per_col: {max_img_num_per_col}")
 
-        self.img_processor = construct_image_processor(
+        self.img_processor = self.construct_image_processor(
             image_transforms=self.img_transforms, size=self.size, normalization=self.normalization
         )
-        self.gt_processor = construct_image_processor(
+        self.gt_processor = self.construct_image_processor(
             image_transforms=self.gt_transforms, size=self.size, normalization=None
         )
         self.train_transforms = self.get_train_transforms(train_transforms)
@@ -178,7 +157,7 @@ class SemanticSegImageProcessor:
     def process_one_sample(
         self,
         image_features: Dict[str, Union[List[str], List[bytearray]]],
-        feature_modalities: Dict[str, List[str]],
+        data_types: Dict[str, List[str]],
         is_training: bool,
         image_mode: Optional[str] = "RGB",
     ) -> Dict:
@@ -190,8 +169,8 @@ class SemanticSegImageProcessor:
         image_features
             One sample may have multiple image columns in a pd.DataFrame and multiple images
             inside each image column.
-        feature_modalities
-            What modality each column belongs to.
+        data_types
+            Data type of all columns.
         is_training
             Whether to process images in the training mode.
         image_mode
@@ -211,7 +190,7 @@ class SemanticSegImageProcessor:
 
         ret = {}
         annotation_column = None
-        for column_name, column_modality in feature_modalities.items():
+        for column_name, column_modality in data_types.items():
             if column_modality == SEMANTIC_SEGMENTATION_IMG:
                 image_column = column_name
             if column_modality == SEMANTIC_SEGMENTATION_GT:
@@ -235,7 +214,9 @@ class SemanticSegImageProcessor:
                 if self.num_classes == 1:
                     gt = gt.convert("L")
                 if self.num_classes > 1:
-                    gt = np.array(gt).astype(
+                    gt = np.array(
+                        gt
+                    ).astype(
                         "float32"
                     )  # There may be issues with 'transforms.ToTensor()' without this line because 'transforms.ToTensor()' converts 'unit8' to values between 0 and 1.
                     gt = Image.fromarray(gt)
@@ -295,7 +276,7 @@ class SemanticSegImageProcessor:
     def __call__(
         self,
         images: Dict[str, List[str]],
-        feature_modalities: Dict[str, Union[int, float, list]],
+        data_types: Dict[str, Union[int, float, list]],
         is_training: bool,
     ) -> Dict:
         """
@@ -305,8 +286,8 @@ class SemanticSegImageProcessor:
         ----------
         images
             Images of one sample.
-        feature_modalities
-            The modality of the feature columns.
+        data_types
+            Data type of all columns.
         is_training
             Whether to process images in the training mode.
 
@@ -315,7 +296,7 @@ class SemanticSegImageProcessor:
         A dictionary containing one sample's processed images and their number.
         """
         images = {k: [v] if isinstance(v, str) else v for k, v in images.items()}
-        return self.process_one_sample(images, feature_modalities, is_training)
+        return self.process_one_sample(images, data_types, is_training)
 
     def get_train_transforms(self, train_transforms):
         train_trans = []
@@ -323,3 +304,19 @@ class SemanticSegImageProcessor:
             if trans_mode == "random_horizontal_flip":
                 train_trans.append(transforms.RandomHorizontalFlip(1.0))
         return transforms.Compose(train_trans)
+
+    def __getstate__(self):
+        odict = self.__dict__.copy()  # get attribute dictionary
+        del odict["img_processor"]
+        del odict["gt_processor"]
+
+        return odict
+
+    def __setstate__(self, state):
+        self.__dict__ = state
+        self.img_processor = self.construct_image_processor(
+            image_transforms=self.img_transforms, size=self.size, normalization=self.normalization
+        )
+        self.gt_processor = self.construct_image_processor(
+            image_transforms=self.gt_transforms, size=self.size, normalization=None
+        )

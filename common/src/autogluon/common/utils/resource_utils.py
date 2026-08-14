@@ -1,5 +1,4 @@
 import logging
-import multiprocessing
 import os
 import shutil
 import subprocess
@@ -7,27 +6,42 @@ from typing import Union
 
 from autogluon.common.utils.try_import import try_import_ray
 
+from .cpu_utils import get_available_cpu_count
 from .distribute_utils import DistributedContext
-from .lite import disable_if_lite_mode
 from .utils import bytes_to_mega_bytes
+
+logger = logging.getLogger(__name__)
 
 
 class ResourceManager:
     """Manager that fetches system related info"""
 
     @staticmethod
-    def get_cpu_count():
-        return multiprocessing.cpu_count()
+    def get_cpu_count(only_physical_cores: bool = False) -> int:
+        """
+        Get the number of available CPU cores.
+
+        Parameters
+        ----------
+        only_physical_cores : bool, default=False
+            If True, detects only physical CPU cores (not including hyperthreading/SMT).
+            This can be beneficial for CPU-intensive tasks like time series forecasting
+            where physical cores often provide better performance than logical cores.
+
+        Returns
+        -------
+        int
+            The number of available CPU cores.
+        """
+        return get_available_cpu_count(only_physical_cores=only_physical_cores)
 
     @staticmethod
-    @disable_if_lite_mode(ret=1)
     def get_cpu_count_psutil(logical=True):
         import psutil
 
         return psutil.cpu_count(logical=logical)
 
     @staticmethod
-    @disable_if_lite_mode(ret=0)
     def get_gpu_count() -> int:
         num_gpus = ResourceManager._get_gpu_count_cuda()
         if num_gpus == 0:
@@ -35,14 +49,83 @@ class ResourceManager:
         return num_gpus
 
     @staticmethod
-    def get_gpu_count_torch():
+    def get_gpu_count_torch(cuda_only: bool = False) -> int:
+        """
+        Get the number of available GPUs
+
+        Parameters
+        ----------
+        cuda_only : bool, default=False
+            If True, only check for CUDA GPUs and ignore other supported accelerators.
+            This is useful for models that only support CUDA and not other accelerators.
+
+        Returns
+        -------
+        int
+            Number of available GPUs. When cuda_only=True, returns the actual CUDA device count.
+        """
         try:
             import torch
 
-            num_gpus = torch.cuda.device_count()
+            if torch.cuda.is_available():
+                num_gpus = torch.cuda.device_count()
+            elif not cuda_only and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                # Apple Silicon MPS (Metal Performance Shaders) support
+                # Apple Silicon Macs have only one integrated GPU
+                num_gpus = 1
+            else:
+                num_gpus = 0
         except Exception:
+            logger.log(
+                40,
+                "\tFailed to import torch or check CUDA availability!"
+                "Please ensure you have the correct version of PyTorch installed by running `pip install -U torch`",
+            )
             num_gpus = 0
         return num_gpus
+
+    @staticmethod
+    def get_available_vram(device: int = 0) -> float | None:
+        """Available GPU memory (VRAM) of `device` in bytes, or None when it cannot be determined.
+
+        The GPU counterpart of `get_available_virtual_mem`. Three effects make this more
+        than a `torch.cuda.mem_get_info` call:
+
+        1. `mem_get_info` reports memory free on the *device*, which excludes memory
+           PyTorch's caching allocator already holds. That memory is reusable by this
+           process without a new device allocation, so it is added back
+           (`memory_reserved - memory_allocated`); ignoring it under-reports what a fit
+           can actually use and needlessly skips models.
+        2. `torch.cuda.set_per_process_memory_fraction` caps this process below the
+           device total. The cap is not visible to `mem_get_info`, so it is applied here —
+           a process allocating past its fraction OOMs even with the device free.
+        3. Without torch/CUDA, `nvidia-smi` gives device-level free memory only (no
+           allocator or fraction information available).
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available() and device < torch.cuda.device_count():
+                device_free, device_total = torch.cuda.mem_get_info(device)
+                cached_unused = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+                available = float(device_free + cached_unused)
+
+                # Respect a per-process cap when one is set (used to partition a GPU
+                # across processes). The getter exists from torch 2.9; older versions
+                # expose no way to read it back, so the cap is simply not applied.
+                get_fraction = getattr(torch.cuda, "get_per_process_memory_fraction", None)
+                if get_fraction is not None:
+                    fraction = float(get_fraction(device))
+                    if fraction < 1.0:
+                        process_headroom = fraction * device_total - torch.cuda.memory_allocated(device)
+                        available = min(available, max(process_headroom, 0.0))
+                return min(available, float(device_total))
+        except Exception:
+            pass
+        memory_free_values = ResourceManager.get_gpu_free_memory()  # MiB per device
+        if device < len(memory_free_values):
+            return float(memory_free_values[device]) * 1024**2
+        return None
 
     @staticmethod
     def get_gpu_free_memory():
@@ -120,7 +203,6 @@ class ResourceManager:
         return output
 
     @staticmethod
-    @disable_if_lite_mode(ret=None)
     def get_process(pid=None):
         import psutil
 
@@ -160,21 +242,36 @@ class ResourceManager:
         return gpu_count
 
     @staticmethod
-    @disable_if_lite_mode(ret=1073741824)  # set to 1GB as an empirical value in lite/web-browser mode.
+    def _get_custom_memory_size():
+        memory_limit = float(os.environ.get("AG_MEMORY_LIMIT_IN_GB"))
+
+        if memory_limit <= 0:
+            raise ValueError("Memory set via `AG_MEMORY_LIMIT_IN_GB` must be greater than 0!")
+
+        # Transform to bytes and return
+        return max(int(memory_limit * (1024.0**3)), 1)
+
+    @staticmethod
     def _get_memory_size() -> float:
+        if os.environ.get("AG_MEMORY_LIMIT_IN_GB", None) is not None:
+            return ResourceManager._get_custom_memory_size()
+
         import psutil
 
         return psutil.virtual_memory().total
 
     @staticmethod
-    @disable_if_lite_mode(ret=1073741824)  # set to 1GB as an empirical value in lite/web-browser mode.
     def _get_memory_rss() -> float:
         return ResourceManager.get_process().memory_info().rss
 
     @staticmethod
-    @disable_if_lite_mode(ret=1073741824)  # set to 1GB as an empirical value in lite/web-browser mode.
     def _get_available_virtual_mem() -> float:
         import psutil
+
+        if os.environ.get("AG_MEMORY_LIMIT_IN_GB", None) is not None:
+            total_memory = ResourceManager._get_custom_memory_size()
+            p = psutil.Process()
+            return total_memory - p.memory_info().rss
 
         return psutil.virtual_memory().available
 
@@ -222,6 +319,11 @@ class RayResourceManager:
     def get_gpu_count() -> int:
         """Get number of gpus available in the cluster"""
         return int(RayResourceManager._get_cluster_resources("GPU"))
+
+    @staticmethod
+    def get_available_virtual_mem(format: str = "B") -> float:
+        bytes = int(RayResourceManager._get_cluster_resources("memory"))
+        return ResourceManager.bytes_converter(value=bytes, format_in="B", format_out=format)
 
 
 def get_resource_manager():

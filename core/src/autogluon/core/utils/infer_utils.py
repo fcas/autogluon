@@ -1,13 +1,19 @@
+import copy
+import time
+
+import numpy as np
 import pandas as pd
 
 
-def get_model_true_infer_speed_per_row_batch(data, *, predictor, batch_size: int = 100000, repeats=1, persist=True, silent=False):
+def get_model_true_infer_speed_per_row_batch(
+    data: pd.DataFrame, *, predictor, batch_size: int = 100000, repeats=1, persist=True, silent=False
+):
     """
     Get per-model true inference speed per row for a given batch size of data.
 
     Parameters
     ----------
-    data : :class:`TabularDataset` or :class:`pd.DataFrame`
+    data : :class:`pd.DataFrame`
         Table of the data, which is similar to a pandas DataFrame.
         Must contain the label column to be compatible with leaderboard call.
     predictor : TabularPredictor
@@ -31,12 +37,6 @@ def get_model_true_infer_speed_per_row_batch(data, *, predictor, batch_size: int
             'pred_time_test_marginal' is the prediction time needed to predict for this particular model minus dependent model inference times and global preprocessing time.
         time_per_row_transform is the time in seconds per row to do the feature preprocessing.
     """
-    import copy
-    import time
-
-    import numpy as np
-    import pandas as pd
-
     data_batch = copy.deepcopy(data)
     len_data = len(data_batch)
     if len_data == batch_size:
@@ -101,14 +101,21 @@ def get_model_true_infer_speed_per_row_batch(data, *, predictor, batch_size: int
 
 
 def get_model_true_infer_speed_per_row_batch_bulk(
-    data: pd.DataFrame, *, predictor, batch_sizes: list = None, repeats=1, persist=True, include_transform_features=False, silent=False
+    data: pd.DataFrame,
+    *,
+    predictor,
+    batch_sizes: list = None,
+    repeats=1,
+    persist=True,
+    include_transform_features=False,
+    silent=False,
 ) -> (pd.DataFrame, pd.DataFrame):
     """
     Get per-model true inference speed per row for a list of batch sizes of data.
 
     Parameters
     ----------
-    data : :class:`TabularDataset` or :class:`pd.DataFrame`
+    data : :class:`pd.DataFrame`
         Table of the data, which is similar to a pandas DataFrame.
         Must contain the label column to be compatible with leaderboard call.
     predictor : TabularPredictor
@@ -162,7 +169,9 @@ def get_model_true_infer_speed_per_row_batch_bulk(
         infer_dfs[key] = infer_dfs[key].reset_index()
         infer_dfs[key]["batch_size"] = key
 
-    infer_df_full_transform = pd.Series(infer_transform_dfs, name="pred_time_test").to_frame().rename_axis("batch_size")
+    infer_df_full_transform = (
+        pd.Series(infer_transform_dfs, name="pred_time_test").to_frame().rename_axis("batch_size")
+    )
     infer_df_full_transform["pred_time_test_marginal"] = infer_df_full_transform["pred_time_test"]
     infer_df_full_transform["pred_time_test_with_transform"] = infer_df_full_transform["pred_time_test"]
     infer_df_full_transform = infer_df_full_transform.reset_index()

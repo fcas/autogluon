@@ -24,7 +24,7 @@ class CatToInt:
     fillna_val : int, default = None
         The default value to fill NaN.
         If None, automatically inferred as a new value not present in existing categories.
-    infrequent_val : int or {'na', 'na+1}, default = 'na'
+    infrequent_val : int or {'na', 'na+1'}, default = 'na'
         The value to group all infrequent categories to (those that aren't within the max_levels most frequent categories).
         If 'na', uses `fillna_val`.
         If 'na+1', uses `fillna_val+1`. This guarantees a new category for infrequent values separate from missing values if `fillna_val=None`.
@@ -70,7 +70,15 @@ class CatToInt:
         return X
 
     def pd_to_np(self, X: DataFrame) -> np.ndarray:
-        return X.to_numpy(dtype=self._dtype, na_value=self.fillna_val, copy=True)
+        """
+        Converts pandas categoricals to a numpy ndarray of the codes of the categories.
+        """
+        with warnings.catch_warnings():
+            if np.issubdtype(self._dtype, np.integer):
+                # Filter incorrect pandas RuntimeWarning message
+                # For more details, refer to https://github.com/autogluon/autogluon/pull/4224#issuecomment-2156423410
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+            return X.to_numpy(dtype=self._dtype, na_value=self.fillna_val, copy=True)
 
     def _get_dtype_and_fillna(self, X: DataFrame, dtype_buffer=2):
         assert dtype_buffer >= 1, "dtype_buffer must be >= 1 or else fillna_val could be invalid."
@@ -83,7 +91,7 @@ class CatToInt:
             except:
                 max_val = X[col].max()
                 min_val = X[col].min()
-            if type(max_val) == str:
+            if isinstance(max_val, str):
                 max_dtype = np.min_scalar_type(max_val)
             else:
                 if max_val_all is None:
@@ -118,7 +126,7 @@ class OneHotEncoderFeatureGenerator(AbstractFeatureGenerator):
     dtype : number type, default = np.uint8
         Desired dtype of output.
     sparse : bool, default = True
-        Will return sparse matrix if set True else will return an array.
+        Will return sparse matrix if set to True else will return an array.
     drop : str, default = None
         Refer to OneHotEncoder documentation for details.
     """

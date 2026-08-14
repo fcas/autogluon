@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, Union
+import warnings
+from typing import Sequence, overload
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,18 @@ class TimeSeriesScorer:
 
     Follows the design of ``autogluon.core.metrics.Scorer``.
 
+    Parameters
+    ----------
+    prediction_length : int, default = 1
+        The length of the forecast horizon. The predictions provided to the ``TimeSeriesScorer`` are expected to contain
+        a forecast for this many time steps for each time series.
+    seasonal_period : int or None, default = None
+        Seasonal period used to compute some evaluation metrics such as mean absolute scaled error (MASE). Defaults to
+        ``None``, in which case the seasonal period is computed based on the data frequency.
+    horizon_weight : Sequence[float], np.ndarray or None, default = None
+        Weight assigned to each time step in the forecast horizon when computing the metric. If provided, the
+        ``horizon_weight`` will be stored as a numpy array of shape ``[1, prediction_length]``.
+
     Attributes
     ----------
     greater_is_better_internal : bool, default = False
@@ -30,15 +43,34 @@ class TimeSeriesScorer:
         Whether the given metric uses the quantile predictions. Some models will modify the training procedure if they
         are trained to optimize a quantile metric.
     equivalent_tabular_regression_metric : str
-        Name of an equivalent metric used by AutoGluon-Tabular with ``problem_type="regression"``. Used by models that
-        train a TabularPredictor under the hood. This attribute should only be specified by point forecast metrics.
+        Name of an equivalent metric used by AutoGluon-Tabular with ``problem_type="regression"``. Used by forecasting
+        models that train tabular regression models under the hood. This attribute should only be specified by point
+        forecast metrics.
+    evaluate_only : bool, default = False
+        Whether the metric can only be used to evaluate a trained predictor but not for model selection. If True,
+        passing this metric as ``eval_metric`` to :class:`~autogluon.timeseries.TimeSeriesPredictor` raises an error.
+        This should be set for diagnostic metrics whose optimum is not achieved by minimizing or maximizing the metric
+        (e.g., signed forecast bias, where both positive and negative values indicate a worse forecast).
     """
 
     greater_is_better_internal: bool = False
     optimum: float = 0.0
     optimized_by_median: bool = False
     needs_quantile: bool = False
-    equivalent_tabular_regression_metric: Optional[str] = None
+    equivalent_tabular_regression_metric: str | None = None
+    evaluate_only: bool = False
+
+    def __init__(
+        self,
+        prediction_length: int = 1,
+        seasonal_period: int | None = None,
+        horizon_weight: Sequence[float] | None = None,
+    ):
+        self.prediction_length = int(prediction_length)
+        if self.prediction_length < 1:
+            raise ValueError(f"prediction_length must be >= 1 (received {prediction_length})")
+        self.seasonal_period = seasonal_period
+        self.horizon_weight = self.check_get_horizon_weight(horizon_weight, prediction_length=prediction_length)
 
     @property
     def sign(self) -> int:
@@ -66,18 +98,25 @@ class TimeSeriesScorer:
         self,
         data: TimeSeriesDataFrame,
         predictions: TimeSeriesDataFrame,
-        prediction_length: int = 1,
         target: str = "target",
-        seasonal_period: Optional[int] = None,
         **kwargs,
     ) -> float:
-        seasonal_period = get_seasonality(data.freq) if seasonal_period is None else seasonal_period
+        seasonal_period = get_seasonality(data.freq) if self.seasonal_period is None else self.seasonal_period
 
-        data_past = data.slice_by_timestep(None, -prediction_length)
-        data_future = data.slice_by_timestep(-prediction_length, None)
+        if "prediction_length" in kwargs:
+            warnings.warn(
+                "Passing `prediction_length` to `TimeSeriesScorer.__call__` is deprecated and will be removed in v2.0. "
+                "Please set the `eval_metric.prediction_length` attribute instead.",
+                category=FutureWarning,
+            )
+            self.prediction_length = kwargs["prediction_length"]
+            self.horizon_weight = self.check_get_horizon_weight(self.horizon_weight, self.prediction_length)
+
+        data_past = data.slice_by_timestep(None, -self.prediction_length)
+        data_future = data.slice_by_timestep(-self.prediction_length, None)
 
         assert not predictions.isna().any().any(), "Predictions contain NaN values."
-        assert (predictions.num_timesteps_per_item() == prediction_length).all()
+        assert (predictions.num_timesteps_per_item() == self.prediction_length).all()
         assert data_future.index.equals(predictions.index), "Prediction and data indices do not match."
 
         try:
@@ -140,7 +179,7 @@ class TimeSeriesScorer:
     ) -> None:
         """Compute auxiliary metrics on past data (before forecast horizon), if the chosen metric requires it.
 
-        This method should only be implemented by metrics that rely on historic (in-sample) data, such as Mean Absolute
+        This method should only be implemented by metrics that rely on historical (in-sample) data, such as Mean Absolute
         Scaled Error (MASE) https://en.wikipedia.org/wiki/Mean_absolute_scaled_error.
 
         We keep this method separate from :meth:`compute_metric` to avoid redundant computations when fitting ensemble.
@@ -159,21 +198,21 @@ class TimeSeriesScorer:
         return self.optimum - self.score(*args, **kwargs)
 
     @staticmethod
-    def _safemean(array: Union[np.ndarray, pd.Series]) -> float:
+    def _safemean(array: np.ndarray | pd.Series) -> float:
         """Compute mean of a numpy array-like object, ignoring inf, -inf and nan values."""
-        return np.mean(array[np.isfinite(array)])
+        return float(np.mean(array[np.isfinite(array)]))
 
     @staticmethod
     def _get_point_forecast_score_inputs(
         data_future: TimeSeriesDataFrame, predictions: TimeSeriesDataFrame, target: str = "target"
-    ) -> Tuple[pd.Series, pd.Series]:
+    ) -> tuple[pd.Series, pd.Series]:
         """Get inputs necessary to compute point forecast metrics.
 
         Returns
         -------
-        y_true : pd.Series, shape [num_items * prediction_length]
+        y_true
             Target time series values during the forecast horizon.
-        y_pred : pd.Series, shape [num_items * prediction_length]
+        y_pred
             Predicted time series values during the forecast horizon.
         """
         y_true = data_future[target]
@@ -183,16 +222,16 @@ class TimeSeriesScorer:
     @staticmethod
     def _get_quantile_forecast_score_inputs(
         data_future: TimeSeriesDataFrame, predictions: TimeSeriesDataFrame, target: str = "target"
-    ) -> Tuple[pd.Series, pd.DataFrame, np.ndarray]:
+    ) -> tuple[pd.Series, pd.DataFrame, np.ndarray]:
         """Get inputs necessary to compute quantile forecast metrics.
 
         Returns
         -------
-        y_true : pd.Series, shape [num_items * prediction_length]
+        y_true
             Target time series values during the forecast horizon.
-        q_pred : pd.DataFrame, shape [num_items * prediction_length, num_quantiles]
+        q_pred
             Quantile forecast for each predicted quantile level. Column order corresponds to ``quantile_levels``.
-        quantile_levels : np.ndarray, shape [num_quantiles]
+        quantile_levels
             Quantile levels for which the forecasts are generated (as floats).
         """
         quantile_columns = [col for col in predictions.columns if col != "mean"]
@@ -200,3 +239,40 @@ class TimeSeriesScorer:
         q_pred = pd.DataFrame(predictions[quantile_columns])
         quantile_levels = np.array(quantile_columns, dtype=float)
         return y_true, q_pred, quantile_levels
+
+    @overload
+    @staticmethod
+    def check_get_horizon_weight(horizon_weight: None, prediction_length: int) -> None: ...
+    @overload
+    @staticmethod
+    def check_get_horizon_weight(
+        horizon_weight: Sequence[float] | np.ndarray, prediction_length: int
+    ) -> np.ndarray: ...
+
+    @staticmethod
+    def check_get_horizon_weight(
+        horizon_weight: Sequence[float] | np.ndarray | None, prediction_length: int
+    ) -> np.ndarray | None:
+        """Convert horizon_weight to a non-negative numpy array that sums up to prediction_length.
+        Raises an exception if horizon_weight has an invalid shape or contains invalid values.
+
+        Returns
+        -------
+        horizon_weight
+            None if the input is None, otherwise a numpy array of shape [1, prediction_length].
+        """
+        if horizon_weight is None:
+            return None
+        horizon_weight_np = np.ravel(horizon_weight).astype(np.float64)
+        if horizon_weight_np.shape != (prediction_length,):
+            raise ValueError(
+                f"horizon_weight must have length equal to {prediction_length=} (got {len(horizon_weight)=})"
+            )
+        if not (horizon_weight_np >= 0).all():
+            raise ValueError(f"All values in horizon_weight must be >= 0 (got {horizon_weight})")
+        if not horizon_weight_np.sum() > 0:
+            raise ValueError(f"At least some values in horizon_weight must be > 0 (got {horizon_weight})")
+        if not np.isfinite(horizon_weight_np).all():
+            raise ValueError(f"All horizon_weight values must be finite (got {horizon_weight})")
+        horizon_weight_np = horizon_weight_np * prediction_length / horizon_weight_np.sum()
+        return horizon_weight_np.reshape([1, prediction_length])

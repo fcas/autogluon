@@ -267,6 +267,18 @@ In the following, we decompose the functionalities of AutoMM and prepare step-by
   How to use TensorRT in accelerating AutoMM model inference.
 :::
 
+:::{grid-item-card} AutoMM Problem Types and Evaluation Metrics.
+  :link: advanced_topics/problem_types_and_metrics.html
+
+  A comprehensive guide to AutoGluon's supported problem types and their evaluation metrics.
+:::
+
+:::{grid-item-card} Multiple Label Columns
+  :link: advanced_topics/multiple_label_columns.html
+
+  How to handle multiple label columns with AutoGluon MultiModal.
+:::
+
 ::::
 
 ```{toctree}

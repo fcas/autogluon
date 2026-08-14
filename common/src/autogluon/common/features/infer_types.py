@@ -25,7 +25,10 @@ def get_type_family_raw(dtype) -> str:
         elif np.issubdtype(dtype, np.floating):
             return "float"
     except Exception as err:
-        logger.error(f"Warning: dtype {dtype} is not recognized as a valid dtype by numpy! " f"AutoGluon may incorrectly handle this feature...")
+        logger.error(
+            f"Warning: dtype {dtype} is not recognized as a valid dtype by numpy! "
+            f"AutoGluon may incorrectly handle this feature..."
+        )
         logger.error(err)
 
     if dtype.name in ["bool", "bool_"]:
@@ -110,7 +113,7 @@ def check_if_datetime_as_object_feature(X: Series) -> bool:
         #  But we don't want pd.Series(['184','822828','20170206']) to be detected as datetime_as_object
         #  Need some smart logic (check min/max values?, check last 2 values don't go >31?)
         pd.to_numeric(X)
-    except:
+    except (ValueError, TypeError):
         try:
             if len(X) > 500:
                 # Sample to speed-up type inference
@@ -119,7 +122,7 @@ def check_if_datetime_as_object_feature(X: Series) -> bool:
             if result.isnull().mean() > 0.8:  # If over 80% of the rows are NaN
                 return False
             return True
-        except:
+        except (ValueError, TypeError):
             return False
     else:
         return False
@@ -139,7 +142,7 @@ def check_if_nlp_feature(X: Series) -> bool:
     if unique_ratio <= 0.01:
         return False
     try:
-        avg_words = Series(X_unique).str.split().str.len().mean()
+        avg_words = Series(X_unique.astype(str)).str.split().str.len().mean()
     except AttributeError:
         return False
     if avg_words < 3:
@@ -170,14 +173,14 @@ def get_bool_true_val(uniques):
     # and therefore we use the unsorted values.
     try:
         # Sort the values to avoid relying on row-order when determining which value is mapped to `True`.
-        uniques.sort()
-    except:
+        uniques = np.sort(uniques)
+    except (ValueError, TypeError):
         pass
     replace_val = uniques[1]
     try:
         # This is to ensure that we don't map np.nan to `True` in the boolean.
         is_nan = np.isnan(replace_val)
-    except:
+    except (ValueError, TypeError):
         if replace_val is None:
             is_nan = True
         else:

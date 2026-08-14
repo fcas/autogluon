@@ -4,20 +4,45 @@ import pathlib
 import shutil
 from typing import Dict, List, Optional, Tuple, Union
 
-from tqdm import tqdm
-
 from ..loaders.load_s3 import list_bucket_prefix_suffix_contains_s3
 
 logger = logging.getLogger(__name__)
 
 
 def is_s3_url(path: str) -> bool:
+    """
+    Checks if path is a s3 uri.
+
+    Params:
+    -------
+    path: str
+        The path to check.
+
+    Returns:
+    --------
+    bool: whether the path is a s3 uri.
+    """
     if (path[:2] == "s3") and ("://" in path[:6]):
         return True
     return False
 
 
 def s3_path_to_bucket_prefix(s3_path: str) -> Tuple[str, str]:
+    """
+    Retrieves the bucket and key from a s3 uri.
+
+    Params:
+    -------
+    origin_path: str
+        The path (s3 uri) to be parsed.
+
+    Returns:
+    --------
+    bucket_name: str
+        the associated bucket name
+    object_key: str
+        the associated key
+    """
     s3_path_cleaned = s3_path.split("://", 1)[1]
     bucket, prefix = s3_path_cleaned.split("/", 1)
 
@@ -43,7 +68,7 @@ def delete_s3_prefix(bucket: str, prefix: str):
         s3.meta.client.delete_objects(Bucket=bucket, Delete=delete_keys)
 
 
-def upload_file(*, file_name: str, bucket: str, prefix: Optional[str] = None):
+def upload_file(*, file_name: str, bucket: str, prefix: Optional[str] = None, **kwargs):
     """
     Upload a file to a S3 bucket
 
@@ -55,21 +80,34 @@ def upload_file(*, file_name: str, bucket: str, prefix: Optional[str] = None):
         Bucket to upload to
     prefix: Optional[str], default = None
         S3 prefix. If not specified then will upload to the root of the bucket
+    kwargs:
+        extra arguments to the `s3.upload_file()` method.
+        For example:
+            ExtraArgs={"ACL": "public-read"}
+                Will make the uploaded files publicly readable
     """
     import boto3
 
     object_name = os.path.basename(file_name)
-    if len(prefix) == 0:
+    if prefix is not None and len(prefix) == 0:
         prefix = None
     if prefix is not None:
         object_name = prefix + "/" + object_name
 
     # Upload the file
     s3_client = boto3.client("s3")
-    s3_client.upload_file(file_name, bucket, object_name)
+    s3_client.upload_file(file_name, bucket, object_name, **kwargs)
 
 
-def upload_s3_folder(*, bucket: str, prefix: str, folder_to_upload: str, dry_run: bool = False, verbose: bool = True):
+def upload_s3_folder(
+    *,
+    bucket: str,
+    prefix: str,
+    folder_to_upload: str,
+    dry_run: bool = False,
+    verbose: bool = True,
+    **kwargs,
+):
     """
     Upload a folder to a S3 bucket and maintain its inner structure
     For example, assuming bucket = bar and prefix = foo, and folder_to_upload looks like this:
@@ -100,6 +138,11 @@ def upload_s3_folder(*, bucket: str, prefix: str, folder_to_upload: str, dry_run
         If True, will instead log every file that will be uploaded and the s3 path to be uploaded to
     verbose: bool, default = True
         Whether to log detailed loggings
+    kwargs:
+        extra arguments to the `s3.upload_file()` method.
+        For example:
+            ExtraArgs={"ACL": "public-read"}
+                Will make the uploaded files publicly readable
     """
     if prefix.endswith("/"):
         prefix = prefix[:-1]
@@ -112,7 +155,12 @@ def upload_s3_folder(*, bucket: str, prefix: str, folder_to_upload: str, dry_run
             logger.log(20, f"Will upload {file_local_path} to s3://{bucket}/{file_prefix}")
         else:
             file_prefix = os.path.dirname(file_prefix)
-            upload_file(file_name=file_local_path, bucket=bucket, prefix=file_prefix if len(file_prefix) > 0 else None)
+            upload_file(
+                file_name=file_local_path,
+                bucket=bucket,
+                prefix=file_prefix if len(file_prefix) > 0 else None,
+                **kwargs,
+            )
 
 
 # TODO: v1.0: Consider changing all instances of `local_path` to `local_prefix`.
@@ -176,19 +224,29 @@ def download_s3_folder(
         Optional arguments to `list_bucket_prefix_suffix_contains_s3` that allow
         more control of which objects are considered.
     """
-    s3_to_local_tuple_list = get_s3_to_local_tuple_list_from_s3_folder(s3_bucket=bucket, s3_prefix=prefix, local_path=local_path, suffix=suffix, **kwargs)
+    s3_to_local_tuple_list = get_s3_to_local_tuple_list_from_s3_folder(
+        s3_bucket=bucket, s3_prefix=prefix, local_path=local_path, suffix=suffix, **kwargs
+    )
     if verbose:
-        logger.log(20, f"Will download {len(s3_to_local_tuple_list)} objects from s3://{bucket}/{prefix} to {local_path}")
+        logger.log(
+            20, f"Will download {len(s3_to_local_tuple_list)} objects from s3://{bucket}/{prefix} to {local_path}"
+        )
     if os.path.isdir(local_path) and not dry_run:
         if error_if_exists:
-            raise ValueError(f"Directory {local_path} already exists. Please pass in a different `local_path` or set `error_if_exsits` to `False`")
+            raise ValueError(
+                f"Directory {local_path} already exists. Please pass in a different `local_path` or set `error_if_exists` to `False`"
+            )
         if delete_if_exists:
-            logger.warning(f"Will delete {local_path} and all its content within because this folder already exists and `delete_if_exists` = `True`")
+            logger.warning(
+                f"Will delete {local_path} and all its content within because this folder already exists and `delete_if_exists` = `True`"
+            )
             shutil.rmtree(local_path)
     download_s3_files(s3_to_local_tuple_list=s3_to_local_tuple_list, dry_run=dry_run)
 
 
-def get_s3_to_local_tuple_list_from_s3_folder(*, s3_bucket: str, s3_prefix: str, local_path: str, **kwargs) -> List[Tuple[str, str]]:
+def get_s3_to_local_tuple_list_from_s3_folder(
+    *, s3_bucket: str, s3_prefix: str, local_path: str, **kwargs
+) -> List[Tuple[str, str]]:
     """
     Given a s3 bucket and prefix, as well as a target local prefix, return a list of tuples of (s3_path, local_path)
     indicating the origin to target file path when downloading from S3 for each file.
@@ -216,12 +274,16 @@ def get_s3_to_local_tuple_list_from_s3_folder(*, s3_bucket: str, s3_prefix: str,
     if len(s3_prefix) > 0:
         assert s3_prefix.endswith("/"), "Please provide a prefix to a folder and end it with '/'"
     objs = list_bucket_prefix_suffix_contains_s3(bucket=s3_bucket, prefix=s3_prefix, **kwargs)
-    s3_to_local_tuple_list = get_s3_to_local_tuple_list(s3_bucket=s3_bucket, s3_prefix=s3_prefix, local_path=local_path, s3_prefixes=objs)
+    s3_to_local_tuple_list = get_s3_to_local_tuple_list(
+        s3_bucket=s3_bucket, s3_prefix=s3_prefix, local_path=local_path, s3_prefixes=objs
+    )
     return s3_to_local_tuple_list
 
 
 # TODO: Add unit tests
-def get_s3_to_local_tuple_list(*, s3_bucket: str, s3_prefix: str, local_path: str, s3_prefixes: List[str]) -> List[Tuple[str, str]]:
+def get_s3_to_local_tuple_list(
+    *, s3_bucket: str, s3_prefix: str, local_path: str, s3_prefixes: List[str]
+) -> List[Tuple[str, str]]:
     """
     Given a list of s3 objects and a target local prefix, return a list of tuples of (s3_path, local_path)
     indicating the origin to target file path when downloading from s3.
@@ -316,10 +378,34 @@ def download_s3_file(
         s3.Bucket(s3_bucket).download_file(s3_prefix, local_path)
 
 
+def copy_s3_file(origin_path: str, destination_path: str) -> None:
+    """
+    Copies s3 file from origin_path to destination_path
+
+    Params:
+    -------
+    origin_path: str
+        The path (s3 uri) to the original location of the object
+    destination_path: str
+        The path (s3 uri) to the intended destination location of the object
+    """
+    import boto3
+
+    origin_bucket, origin_key = s3_path_to_bucket_prefix(origin_path)
+    destination_bucket, destination_key = s3_path_to_bucket_prefix(destination_path)
+
+    s3 = boto3.client("s3")
+    s3.copy_object(
+        Bucket=destination_bucket, CopySource={"Bucket": origin_bucket, "Key": origin_key}, Key=destination_key
+    )
+
+
 def download_s3_files(*, s3_to_local_tuple_list: List[Tuple[str, str]], dry_run: bool = False, verbose: bool = False):
     """
     For (s3_path, local_path) in `s3_to_local_tuple_list`, call `download_s3_file`.
     """
+    from tqdm import tqdm
+
     for s3_path, _ in s3_to_local_tuple_list:
         assert is_s3_url(path=s3_path), f'S3 path is not a valid S3 URL: "{s3_path}"'
     num_files = len(s3_to_local_tuple_list)

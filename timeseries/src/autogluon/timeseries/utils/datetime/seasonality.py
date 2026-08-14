@@ -1,5 +1,3 @@
-from typing import Union
-
 import pandas as pd
 
 from .base import norm_freq_str
@@ -22,12 +20,14 @@ DEFAULT_SEASONALITIES = {
 }
 
 
-def get_seasonality(freq: Union[str, None]) -> int:
+def get_seasonality(freq: str | None) -> int:
     """Return the seasonality of a given frequency. Adapted from ``gluonts.time_feature.seasonality``."""
     if freq is None:
         return 1
 
     offset = pd.tseries.frequencies.to_offset(freq)
+
+    assert offset is not None  # offset is only None if freq is None
     offset_name = norm_freq_str(offset)
     base_seasonality = DEFAULT_SEASONALITIES.get(offset_name, 1)
 

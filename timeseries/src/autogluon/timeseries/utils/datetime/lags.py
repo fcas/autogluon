@@ -2,8 +2,6 @@
 Generate lag indices based on frequency string. Adapted from gluonts.time_feature.lag.
 """
 
-from typing import List, Optional
-
 import numpy as np
 import pandas as pd
 
@@ -70,9 +68,9 @@ def _make_lags_for_semi_month(multiple, num_cycles=3):
 def get_lags_for_frequency(
     freq: str,
     lag_ub: int = 1200,
-    num_lags: Optional[int] = None,
+    num_lags: int | None = None,
     num_default_lags: int = 7,
-) -> List[int]:
+) -> list[int]:
     """
     Generates a list of lags that that are appropriate for the given frequency
     string.
@@ -95,6 +93,9 @@ def get_lags_for_frequency(
     """
 
     offset = pd.tseries.frequencies.to_offset(freq)
+
+    if offset is None:
+        raise ValueError(f"Invalid frequency: {freq}")
     offset_name = norm_freq_str(offset)
 
     if offset_name == "YE":
@@ -161,7 +162,7 @@ def get_lags_for_frequency(
         raise Exception(f"Cannot get lags for unsupported frequency {freq}")
 
     # flatten lags list and filter
-    lags = [int(lag) for sub_list in lags for lag in sub_list if 7 < lag <= lag_ub]
+    lags = [int(lag) for sub_list in lags for lag in sub_list if num_default_lags < lag <= lag_ub]
     lags = list(range(1, num_default_lags + 1)) + sorted(list(set(lags)))
 
     return sorted(set(lags))[:num_lags]

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import time
 import warnings
 from builtins import classmethod
 from functools import partial
 from pathlib import Path
-from typing import Dict, Union
+from types import MappingProxyType
+from typing import Union
 
 import numpy as np
 import pandas as pd
@@ -25,9 +27,10 @@ from autogluon.common.features.types import (
     S_TEXT_SPECIAL,
 )
 from autogluon.common.utils.pandas_utils import get_approximate_df_mem_usage
+from autogluon.common.utils.random import get_numpy_seed
 from autogluon.common.utils.resource_utils import ResourceManager
 from autogluon.common.utils.try_import import try_import_fastai
-from autogluon.core.constants import BINARY, QUANTILE, REGRESSION
+from autogluon.core.constants import BINARY, MULTICLASS, QUANTILE, REGRESSION
 from autogluon.core.hpo.constants import RAY_BACKEND
 from autogluon.core.models import AbstractModel
 from autogluon.core.utils.exceptions import TimeLimitExceeded
@@ -38,6 +41,8 @@ from autogluon.tabular.models.tabular_nn.utils.nn_architecture_utils import infe
 
 from .hyperparameters.parameters import get_param_baseline
 from .hyperparameters.searchspaces import get_default_searchspace
+
+warnings.filterwarnings("ignore", message="load_learner` uses Python's insecure pickle module")
 
 # FIXME: Has a leak somewhere, training additional models in a single python script will slow down training for each additional model. Gets very slow after 20+ models (10x+ slowdown)
 #  Slowdown does not appear to impact Mac OS
@@ -92,7 +97,27 @@ class NNFastAiTabularModel(AbstractModel):
         'early.stopping.patience': 10,
     """
 
+    ag_key = "FASTAI"
+    ag_name = "NeuralNetFastAI"
+    ag_priority = 50
+    # Increase priority for multiclass since neural networks
+    # scale better than trees as a function of n_classes.
+    ag_priority_by_problem_type = MappingProxyType(
+        {
+            MULTICLASS: 95,
+        }
+    )
+    seed_name = "random_seed"
+    _supported_problem_types = ["binary", "multiclass", "regression", "quantile"]
+
     model_internals_file_name = "model-internals.pkl"
+
+    _default_auxiliary_params_extra = dict(
+        valid_raw_types=[R_BOOL, R_INT, R_FLOAT, R_CATEGORY],
+        ignored_type_group_special=[S_TEXT_NGRAM, S_TEXT_AS_CATEGORY],
+    )
+    minimum_num_gpus = 0.5
+    default_resources_physical_cores_only = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -113,7 +138,7 @@ class NNFastAiTabularModel(AbstractModel):
         from fastai.tabular.core import TabularPandas
         from fastcore.basics import range_of
 
-        X = self.preprocess(X, fit=True)
+        X = self.preprocess(X, y=y, fit=True)
         if X_val is not None:
             X_val = self.preprocess(X_val)
 
@@ -123,8 +148,15 @@ class NNFastAiTabularModel(AbstractModel):
 
         if self.problem_type in [REGRESSION, QUANTILE] and self.y_scaler is not None:
             y_norm = pd.Series(self.y_scaler.fit_transform(y.values.reshape(-1, 1)).reshape(-1))
-            y_val_norm = pd.Series(self.y_scaler.transform(y_val.values.reshape(-1, 1)).reshape(-1)) if y_val is not None else None
-            logger.log(0, f"Training with scaled targets: {self.y_scaler} - !!! NN training metric will be different from the final results !!!")
+            y_val_norm = (
+                pd.Series(self.y_scaler.transform(y_val.values.reshape(-1, 1)).reshape(-1))
+                if y_val is not None
+                else None
+            )
+            logger.log(
+                0,
+                f"Training with scaled targets: {self.y_scaler} - !!! NN training metric will be different from the final results !!!",
+            )
         else:
             y_norm = y
             y_val_norm = y_val
@@ -151,14 +183,26 @@ class NNFastAiTabularModel(AbstractModel):
             self.cont_columns = self._feature_metadata.get_features(valid_raw_types=[R_INT, R_FLOAT, R_DATETIME])
             self.cat_columns = self._feature_metadata.get_features(valid_raw_types=[R_OBJECT, R_CATEGORY, R_BOOL])
             if self.cont_columns:
-                self._cont_normalization = (np.array(X[self.cont_columns].mean()), np.array(X[self.cont_columns].std()))
+                # Drop columns that have less than 2 unique values (ignoring NaNs)
+                # If these columns are kept, it will raise an exception when trying to normalize.
+                # TODO: Can instead treat them as boolean if 1 unique + NaN
+                unique_vals = X[self.cont_columns].nunique()
+                self.cont_columns = [c for c in self.cont_columns if unique_vals[c] > 1]
+            if self.cont_columns:
+                self._cont_normalization = (
+                    np.array(X[self.cont_columns].mean()),
+                    np.array(X[self.cont_columns].std()),
+                )
 
             num_cat_cols_og = len(self.cat_columns)
             if self.cat_columns:
                 try:
                     X_stats = X[self.cat_columns].describe(include="all").T.reset_index()
                     cat_cols_to_drop = list(
-                        X_stats[(X_stats["unique"] > self.params.get("max_unique_categorical_values", 10000)) | (X_stats["unique"].isna())]["index"].values
+                        X_stats[
+                            (X_stats["unique"] > self.params.get("max_unique_categorical_values", 10000))
+                            | (X_stats["unique"].isna())
+                        ]["index"].values
                     )
                 except:
                     cat_cols_to_drop = []
@@ -168,7 +212,9 @@ class NNFastAiTabularModel(AbstractModel):
             num_cat_cols_use = len(self.cat_columns)
             logger.log(15, f"Using {num_cat_cols_use}/{num_cat_cols_og} categorical features")
 
-            nullable_numeric_features = self._feature_metadata.get_features(valid_raw_types=[R_FLOAT, R_DATETIME], invalid_special_types=[S_TEXT_SPECIAL])
+            nullable_numeric_features = self._feature_metadata.get_features(
+                valid_raw_types=[R_FLOAT, R_DATETIME], invalid_special_types=[S_TEXT_SPECIAL]
+            )
             self.columns_fills = dict()
             self._columns_fills_names = nullable_numeric_features
             for c in self._columns_fills_names:  # No need to do this for int features, int can't have null
@@ -208,7 +254,9 @@ class NNFastAiTabularModel(AbstractModel):
             df = df.copy()
         return df
 
-    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, num_cpus=None, num_gpus=0, sample_weight=None, **kwargs):
+    def _fit(
+        self, X, y, X_val=None, y_val=None, time_limit=None, num_cpus=None, num_gpus=0, sample_weight=None, **kwargs
+    ):
         try_import_fastai()
         import torch
         from fastai import torch_core
@@ -221,7 +269,10 @@ class NNFastAiTabularModel(AbstractModel):
         torch.set_num_threads(num_cpus)
         start_time = time.time()
         if sample_weight is not None:  # TODO: support
-            logger.log(15, "sample_weight not yet supported for NNFastAiTabularModel, this model will ignore them in training.")
+            logger.log(
+                15,
+                "sample_weight not yet supported for NNFastAiTabularModel, this model will ignore them in training.",
+            )
 
         params = self._get_model_params()
         self._num_cpus_infer = params.pop("_num_cpus_infer", 1)
@@ -304,8 +355,9 @@ class NNFastAiTabularModel(AbstractModel):
         # Make deterministic
         from fastai.torch_core import set_seed
 
-        set_seed(0, True)
-        dls.rng.seed(0)
+        random_seed = params.pop(self.seed_name, self.default_random_seed)
+        set_seed(random_seed, True)
+        dls.rng.seed(get_numpy_seed(random_seed))
 
         if self.problem_type == QUANTILE:
             dls.c = len(self.quantile_levels)
@@ -321,13 +373,19 @@ class NNFastAiTabularModel(AbstractModel):
 
         fname = "model"
         save_callback = AgSaveModelCallback(
-            monitor=objective_func_name_to_monitor, comp=objective_optim_mode, fname=fname, best_epoch_stop=best_epoch_stop, with_opt=True
+            monitor=objective_func_name_to_monitor,
+            comp=objective_optim_mode,
+            fname=fname,
+            best_epoch_stop=best_epoch_stop,
+            with_opt=True,
         )
 
         if time_limit is not None:
             time_elapsed = time.time() - start_time
             time_left = time_limit - time_elapsed
-            if time_left <= time_limit * 0.7:  # if 30% of time was spent preprocessing, likely not enough time to train model
+            if (
+                time_left <= time_limit * 0.7
+            ):  # if 30% of time was spent preprocessing, likely not enough time to train model
                 raise TimeLimitExceeded
         else:
             time_left = None
@@ -343,6 +401,7 @@ class NNFastAiTabularModel(AbstractModel):
 
         callbacks = [save_callback, early_stopping]
 
+        # TODO: Optimize by using io.BytesIO() instead of temp_dir for checkpointing?
         with make_temp_directory() as temp_dir:
             with self.model.no_bar():
                 with self.model.no_logging():
@@ -350,7 +409,12 @@ class NNFastAiTabularModel(AbstractModel):
                     self.model.path = Path(temp_dir)
 
                     len_val = len(X_val) if X_val is not None else 0
-                    epochs = self._get_epochs_number(samples_num=len(X) + len_val, epochs=params["epochs"], batch_size=batch_size, time_left=time_left)
+                    epochs = self._get_epochs_number(
+                        samples_num=len(X) + len_val,
+                        epochs=params["epochs"],
+                        batch_size=batch_size,
+                        time_left=time_left,
+                    )
                     if epochs == 0:
                         # Stop early if there is not enough time to train a full epoch
                         raise TimeLimitExceeded
@@ -358,7 +422,7 @@ class NNFastAiTabularModel(AbstractModel):
                     self.model.fit_one_cycle(epochs, params["lr"], cbs=callbacks)
 
                     # Load the best one and export it
-                    self.model = self.model.load(fname)
+                    self.model = self.model.load(fname, weights_only=False)  # nosec B614
 
                     if objective_func_name == "log_loss":
                         eval_result = self.model.validate(dl=dls.valid)[0]
@@ -453,7 +517,9 @@ class NNFastAiTabularModel(AbstractModel):
                 objective_func_name = "pinball_loss"
             else:
                 objective_func_name = "log_loss"
-            logger.warning(f"Metric {stopping_metric.name} is not supported by this model - using {objective_func_name} instead")
+            logger.warning(
+                f"Metric {stopping_metric.name} is not supported by this model - using {objective_func_name} instead"
+            )
 
         nn_metric = metrics_map.get(objective_func_name, None)
 
@@ -461,7 +527,11 @@ class NNFastAiTabularModel(AbstractModel):
 
     def __get_objective_func_to_monitor(self, objective_func_name):
         monitor_obj_func = {
-            **{k: m.name if hasattr(m, "name") else m.__name__ for k, m in self.__get_metrics_map().items() if m is not None},
+            **{
+                k: m.name if hasattr(m, "name") else m.__name__
+                for k, m in self.__get_metrics_map().items()
+                if m is not None
+            },
             "log_loss": "valid_loss",
         }
         objective_func_name_to_monitor = objective_func_name
@@ -513,7 +583,9 @@ class NNFastAiTabularModel(AbstractModel):
         self.model = __model
         # Export model
         if self._load_model:
-            save_pkl.save_with_fn(f"{path}{self.model_internals_file_name}", self.model, pickle_fn=lambda m, buffer: export(m, buffer), verbose=verbose)
+            save_pkl.save_with_fn(
+                self._model_internals_path, self.model, pickle_fn=lambda m, buffer: export(m, buffer), verbose=verbose
+            )
         self._load_model = None
         return path
 
@@ -533,11 +605,17 @@ class NNFastAiTabularModel(AbstractModel):
             if plt != "Windows":
                 og_windows_path = pathlib.WindowsPath
                 pathlib.WindowsPath = pathlib.PosixPath
-            model.model = load_pkl.load_with_fn(f"{model.path}{model.model_internals_file_name}", lambda p: load_learner(p), verbose=verbose)
+            model_internals_path = os.path.join(path, model.model_internals_file_name)
+            model.model = load_pkl.load_with_fn(model_internals_path, lambda p: load_learner(p), verbose=verbose)
             if og_windows_path is not None:
                 pathlib.WindowsPath = og_windows_path
         model._load_model = None
         return model
+
+    @property
+    def _model_internals_path(self) -> str:
+        """Path to model-internals.pkl"""
+        return os.path.join(self.path, self.model_internals_file_name)
 
     def _set_default_params(self):
         """Specifies hyperparameter values to use by default"""
@@ -547,21 +625,6 @@ class NNFastAiTabularModel(AbstractModel):
 
     def _get_default_searchspace(self):
         return get_default_searchspace(self.problem_type, num_classes=None)
-
-    def _get_default_auxiliary_params(self) -> dict:
-        default_auxiliary_params = super()._get_default_auxiliary_params()
-        extra_auxiliary_params = dict(
-            valid_raw_types=[R_BOOL, R_INT, R_FLOAT, R_CATEGORY],
-            ignored_type_group_special=[S_TEXT_NGRAM, S_TEXT_AS_CATEGORY],
-        )
-        default_auxiliary_params.update(extra_auxiliary_params)
-        return default_auxiliary_params
-
-    def _get_default_resources(self):
-        # logical=False is faster in training
-        num_cpus = ResourceManager.get_cpu_count_psutil(logical=False)
-        num_gpus = 0
-        return num_cpus, num_gpus
 
     def __get_metrics_map(self):
         from fastai.metrics import FBeta, Precision, R2Score, Recall, RocAucBinary, accuracy, mae, mse, rmse
@@ -592,29 +655,34 @@ class NNFastAiTabularModel(AbstractModel):
             "recall_micro": Recall(average="micro"),
             "recall_weighted": Recall(average="weighted"),
             "log_loss": None,
-            "pinball_loss": HuberPinballLoss(quantile_levels=self.quantile_levels)
+            "pinball_loss": HuberPinballLoss(quantile_levels=self.quantile_levels),
             # Not supported: pac_score
         }
         return metrics_map
 
-    def _estimate_memory_usage(self, X, **kwargs):
+    @classmethod
+    def _estimate_memory_usage_static(
+        cls,
+        *,
+        X: pd.DataFrame,
+        **kwargs,
+    ) -> int:
         return 10 * get_approximate_df_mem_usage(X).sum()
 
     def _get_hpo_backend(self):
         """Choose which backend(Ray or Custom) to use for hpo"""
         return RAY_BACKEND
 
-    def _get_maximum_resources(self) -> Dict[str, Union[int, float]]:
+    def _get_maximum_resources(self) -> dict[str, Union[int, float]]:
         # fastai model trains slower when utilizing virtual cores and this issue scale up when the number of cpu cores increases
-        return {"num_cpus": ResourceManager.get_cpu_count_psutil(logical=False)}
+        return {"num_cpus": ResourceManager.get_cpu_count(only_physical_cores=True)}
 
-    def get_minimum_resources(self, is_gpu_available=False):
-        minimum_resources = {
-            "num_cpus": 1,
+    @classmethod
+    def _class_tags(cls):
+        return {
+            "reset_torch_threads": True,
+            "reset_torch_cudnn_deterministic": True,
         }
-        if is_gpu_available:
-            minimum_resources["num_gpus"] = 0.5
-        return minimum_resources
 
     def _more_tags(self):
         return {"can_refit_full": True}

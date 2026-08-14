@@ -49,44 +49,42 @@
 ## Prior to release: 1 day out
 
 * Ensure that the mainline code you are planning to release is stable: Benchmark, ensure CI passes, check with team, etc.
-* Cut a release branch with format `0.x.y` (no v) - this branch is required to publish docs to versioned path
-  * Clone from master branch
-  * Add 1 commit to the release branch to remove pre-release warnings and update install instructions to remove `--pre`: [Old diff](https://github.com/autogluon/autogluon/commit/1d66194d4685b06e884bbf15dcb97580cbfb9261)
-  * Add 1 commit that converts notebook links from `master` to `stable` by running this command from the root project directory: `LC_ALL=C find docs/tutorials/ -type f -exec sed -i '' 's#blob/master/docs#blob/stable/docs#' {} +`
-  * Update links to AG sub-modules website to be stable ones, i.e. cloud
-  * Push release branch
-  * Build the release branch docs in [CI](https://ci.gluon.ai/job/autogluon/).
-  * Once CI passes, verify it's available at `https://auto.gluon.ai/0.x.y/index.html`
-* Prepare the release notes located in `docs/whats_new/v0.x.y.md`:
+* Prepare the release notes located in `docs/whats_new/vX.Y.Z.md`:
   * This will be copy-pasted into GitHub when you release.
   * Include all merged PRs into the notes and mention all PR authors / contributors (refer to past releases for examples).
   * Prioritize major features before minor features when ordering, otherwise order by merge date.
+  * Run the script `release_instructions/add_links_to_release_notes.py` to add links to all pull requests and GitHub users mentioned in the release notes.
   * Review with at least 2 core maintainers to ensure release notes are correct.
+  * Merge a PR that adds the new `docs/whats_new/vX.Y.Z.md` file. Ensure you also update the `docs/whats_new/index.md` in the same PR.
+    * DO NOT commit the `docs/whats_new/vX.Y.Z_paste_to_github.md` file that is created. This is only used for pasting the GitHub release notes.
+* Versioned docs are published automatically from the `vX.Y.Z` release tag (see the Release step below). CI computes the URL from the tag: `vX.Y.Z` publishes to `https://auto.gluon.ai/X.Y/index.html` (bare `major.minor`, no `v`). Patch releases refresh the same `/X.Y/` page.
+  * No separate `X.Y.Z` release branch is needed. The `stable` branch below is still required — it is what publishes `/stable/`.
 
 ## Release
 
 * Update the `stable` documentation to the new release:
   * Delete the `stable` branch.
-  * Create new `stable` branch from `0.x.y` branch (They should be identical).
-  * Add and push any change in `docs/README.md` (i.e. space) to ensure `stable` branch is different from `0.x.y`. 
-    * This is required for GH Action to execute CI continuous integration step if `0.x.y` and `stable` hashes are matching.
+  * Create new `stable` branch from the `vX.Y.Z` tag (They should be identical).
   * Wait for CI build of the `stable` branch to pass
   * Check that website has updated to align with the release docs.
 * Perform version release by going to https://github.com/autogluon/autogluon/releases and click 'Draft a new release' in top right.
-  * Tag release with format `v0.x.y`
-  * Name the release identically to the tag (ex: `v0.x.y`)
+  * Tag release with format `vX.Y.Z`
+  * Name the release identically to the tag (ex: `vX.Y.Z`)
   * Select `master` branch as a target
     * Note: we generally use master unless there are certain commits there we don't want to add to the release
   * DO NOT use the 'Save draft' option during the creation of the release. This breaks GitHub pipelines.
-  * Copy-paste the content of `docs/whats_new/v0.x.y.md` into the release notes box.
+  * Copy-paste the content of `docs/whats_new/vX.Y.Z_paste_to_github.md` into the release notes box.
+    * If this file doesn't exist, run `release_instructions/add_links_to_release_notes.py` to generate it.
+    * DO NOT use `docs/whats_new/vX.Y.Z.md` -> This will break GitHub's contributor detection logic due to the URLs present around the GitHub aliases. This is why we need to use the `_paste_to_github.md` variant.
     * Ensure release notes look correct and make any final formatting fixes.
   * Click 'Publish release' and the release will go live.
+  * Publishing the `vX.Y.Z` tag triggers CI, which builds the versioned docs and publishes them to `https://auto.gluon.ai/X.Y/index.html`. Once CI passes, verify the page is available and correct.
 * Wait ~10 minutes and then locally test that the PyPi package is available and working with the latest release version, ask team members to also independently verify.
 
 ## Conda-Forge Release
 
 After GitHub & PyPi release, conduct release on Conda-Forge
-* [TODO] Add Conda-Forge release steps.
+* Please refer to [conda release instructions](update-conda-recipes.md) for details.
 
 ## Release Cheatsheet
 
@@ -102,8 +100,8 @@ After GitHub & PyPi release, conduct release on Conda-Forge
 
 After release is published, on the mainline branch:
 * Update `release` in `docs/conf.py`
-* Increment version in the `VERSION` file
-* Update doc links in `docs/versions.rst`
+* Increment version in the `VERSION` file and `SECURITY.md`
+* On a new minor release, add the minor it displaces from stable to the "Previous releases" list in `docs/versions.rst` (e.g. releasing 1.7 adds a `1.6` link). Patch releases need no change.
 * Update `README.md` sample code with new release version.
 * Send release update to internal and external slack channels and mailing lists
 * Publish any blogs / talks planned for release to generate interest.
@@ -112,4 +110,7 @@ After release is published, on the mainline branch:
 
 Conda-Forge releases are mutable and can be changed post-release to fix breaking bugs without releasing a new version.
 
-* [TODO] Add Conda-Forge post-release patching guidelines.
+* Create a new branch in your forked `autogluon.{module}-feedstock` repo
+* Make necessary updates on packages for patching
+* Increment the `number` field under `build` by 1 and keep the rest of `package` and `source` information unchanged
+* Refer to [conda release instructions](update-conda-recipes.md) for more details

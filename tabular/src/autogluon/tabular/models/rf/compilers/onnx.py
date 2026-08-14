@@ -83,7 +83,7 @@ class RFOnnxCompiler:
             The compiler would optimize the model to perform best with the given input type.
         """
         if input_types is None or not isinstance(input_types[0], tuple):
-            raise RuntimeError("input_types argument should contain at least one tuple" ", e.g. [((1, 14), np.float32)]")
+            raise RuntimeError("input_types argument should contain at least one tuple, e.g. [((1, 14), np.float32)]")
         if isinstance(model, RFOnnxPredictor):
             return model
 
@@ -109,8 +109,9 @@ class RFOnnxCompiler:
     @staticmethod
     def save(model, path: str) -> str:
         """Save the compiled model into onnx file format."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(os.path.join(path, "model.onnx"), "wb") as f:
+        file_path = os.path.join(path, "model.onnx")
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "wb") as f:
             f.write(model.SerializeToString())
         return os.path.join(path, "model.onnx")
 

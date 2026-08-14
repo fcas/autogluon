@@ -1,9 +1,10 @@
-import json
+from __future__ import annotations
+
 import logging
 import multiprocessing
 import os
 from io import StringIO
-from typing import List, Optional
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -21,15 +22,14 @@ logger = logging.getLogger(__name__)
 # TODO: Add `allow_overwrite=True` so that users can instead force
 #  an error by setting to False if saving would overwrite an existing file.
 def save(
-    path: str,
+    path: str | Path,
     df: pd.DataFrame,
     index: bool = False,
     verbose: bool = True,
-    type: Optional[str] = None,
+    type: str | None = None,
     sep: str = ",",
     compression: str = "gzip",
     header: bool = True,
-    json_dump_columns: Optional[List[str]] = None,
 ):
     """
     Save pandas DataFrame to the file path.
@@ -63,11 +63,8 @@ def save(
     load the file via `autogluon.common.loaders.load_pd.load(path=path)`.
 
     """
-    if json_dump_columns is not None:
-        df = df.copy()
-        for column in json_dump_columns:
-            if column in df.columns.values:
-                df[column] = [json.dumps(x[0]) for x in zip(df[column])]
+    if isinstance(path, Path):
+        path = str(path)
     if type is None:
         if path[-1] == "/" and s3_utils.is_s3_url(path):  # and path[:2] == 's3'
             type = "multipart_s3"
@@ -104,10 +101,7 @@ def save(
         if verbose:
             logger.log(15, "Saved " + str(path) + " | Columns = " + str(column_count) + " | Rows = " + str(row_count))
     elif type == "parquet":
-        try:
-            df.to_parquet(path, compression=compression, engine="fastparquet")  # TODO: Might be slower than pyarrow in multiprocessing
-        except:
-            df.to_parquet(path, compression=compression, engine="pyarrow")
+        df.to_parquet(path, compression=compression)
         if verbose:
             logger.log(15, "Saved " + str(path) + " | Columns = " + str(column_count) + " | Rows = " + str(row_count))
     elif type == "multipart_s3":
@@ -119,7 +113,16 @@ def save(
         #  Multipart Parquet loading would see 20 parts and try to load all of them, resulting in at best an exception,
         #  and at worst the unintended and silent concatenation of two different DataFrames.
         s3_utils.delete_s3_prefix(bucket=bucket, prefix=prefix)  # TODO: Might only delete the first 1000!
-        _save_multipart(path=path, df=df, index=index, verbose=verbose, type="parquet", sep=sep, compression=compression, header=header, json_dump_columns=None)
+        _save_multipart(
+            path=path,
+            df=df,
+            index=index,
+            verbose=verbose,
+            type="parquet",
+            sep=sep,
+            compression=compression,
+            header=header,
+        )
     elif type == "multipart_local":
         # TODO: v1.0 : Ensure the same file deletion process best practice occurs during multipart local saving.
         if os.path.isdir(path):
@@ -130,17 +133,35 @@ def save(
                         os.unlink(file_path)
                 except Exception as e:
                     logger.exception(e)
-        _save_multipart(path=path, df=df, index=index, verbose=verbose, type="parquet", sep=sep, compression=compression, header=header, json_dump_columns=None)
+        _save_multipart(
+            path=path,
+            df=df,
+            index=index,
+            verbose=verbose,
+            type="parquet",
+            sep=sep,
+            compression=compression,
+            header=header,
+        )
     else:
         raise Exception("Unknown save type: " + type)
 
 
 def _save_multipart_child(chunk):
-    path, df, index, verbose, type, sep, compression, header, json_dump_columns = chunk
-    save(path=path, df=df, index=index, verbose=verbose, type=type, sep=sep, compression=compression, header=header, json_dump_columns=json_dump_columns)
+    path, df, index, verbose, type, sep, compression, header = chunk
+    save(
+        path=path,
+        df=df,
+        index=index,
+        verbose=verbose,
+        type=type,
+        sep=sep,
+        compression=compression,
+        header=header,
+    )
 
 
-def _save_multipart(path, df, index=False, verbose=True, type=None, sep=",", compression="snappy", header=True, json_dump_columns=None):
+def _save_multipart(path, df, index=False, verbose=True, type=None, sep=",", compression="snappy", header=True):
     cpu_count = multiprocessing.cpu_count()
     workers_count = int(round(cpu_count))
     parts = workers_count
@@ -160,11 +181,12 @@ def _save_multipart(path, df, index=False, verbose=True, type=None, sep=",", com
             sep,
             compression,
             header,
-            json_dump_columns,
         ]
         for path, df_part in zip(paths, df_parts)
     ]
 
-    multiprocessing_utils.execute_multiprocessing(workers_count=workers_count, transformer=_save_multipart_child, chunks=full_chunks)
+    multiprocessing_utils.execute_multiprocessing(
+        workers_count=workers_count, transformer=_save_multipart_child, chunks=full_chunks
+    )
 
     logger.log(15, "Saved multipart file to " + str(path))

@@ -1,5 +1,7 @@
 """Wrapper of the MultiModalPredictor."""
 
+from __future__ import annotations
+
 import logging
 import os
 from typing import Dict, Optional
@@ -26,7 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 class MultiModalPredictorModel(AbstractModel):
+    ag_key = "AG_AUTOMM"
+    ag_name = "MultiModalPredictor"
+    _supported_problem_types = ["binary", "multiclass", "regression"]
     _NN_MODEL_NAME = "automm_model"
+
+    _default_auxiliary_params_extra = dict(
+        valid_raw_types=[R_INT, R_FLOAT, R_CATEGORY, R_OBJECT],
+        ignored_type_group_special=[S_TEXT_NGRAM, S_TEXT_AS_CATEGORY, S_TEXT_SPECIAL],
+    )
+    _default_ag_args_ensemble_extra = {"fold_fitting_strategy": "sequential_local"}
+    minimum_num_gpus = 1
+    gpu_required = True
 
     def __init__(self, **kwargs):
         """Wrapper of autogluon.multimodal.MultiModalPredictor.
@@ -62,37 +75,23 @@ class MultiModalPredictorModel(AbstractModel):
             Names of the features.
         feature_metadata
             The feature metadata.
+
+        .. versionadded:: 0.3.0
         """
         super().__init__(**kwargs)
         self._label_column_name = None
         self._load_model = None  # Whether to load inner model when loading.
-
-    def _get_default_auxiliary_params(self) -> dict:
-        default_auxiliary_params = super()._get_default_auxiliary_params()
-        extra_auxiliary_params = dict(
-            valid_raw_types=[R_INT, R_FLOAT, R_CATEGORY, R_OBJECT],
-            ignored_type_group_special=[S_TEXT_NGRAM, S_TEXT_AS_CATEGORY, S_TEXT_SPECIAL],
-        )
-        default_auxiliary_params.update(extra_auxiliary_params)
-        return default_auxiliary_params
 
     @classmethod
     def _get_default_ag_args(cls) -> dict:
         default_ag_args = super()._get_default_ag_args()
         extra_ag_args = {
             "valid_stacker": False,
-            "problem_types": [BINARY, MULTICLASS, REGRESSION],
         }
         default_ag_args.update(extra_ag_args)
         return default_ag_args
 
     # FIXME: Enable parallel bagging once AutoMM supports being run within Ray without hanging
-    @classmethod
-    def _get_default_ag_args_ensemble(cls, **kwargs) -> dict:
-        default_ag_args_ensemble = super()._get_default_ag_args_ensemble(**kwargs)
-        extra_ag_args_ensemble = {"fold_fitting_strategy": "sequential_local"}
-        default_ag_args_ensemble.update(extra_ag_args_ensemble)
-        return default_ag_args_ensemble
 
     def _set_default_params(self):
         super()._set_default_params()
@@ -103,7 +102,7 @@ class MultiModalPredictorModel(AbstractModel):
         Preprocessing training and validation data.
         This method is a placeholder for inheriting models to override with more complex functionality if needed.
         """
-        X = self.preprocess(X=X, **kwargs)
+        X = self.preprocess(X=X, y=y, **kwargs)
         if X_val is not None:
             X_val = self.preprocess(X=X_val, **kwargs)
         return X, y, X_val, y_val
@@ -154,7 +153,9 @@ class MultiModalPredictorModel(AbstractModel):
 
         X, y, X_val, y_val = self.preprocess_fit(X=X, y=y, X_val=X_val, y_val=y_val)
         params = self._get_model_params()
-        max_features = params.pop("_max_features", None)  # FIXME: `_max_features` is a hack. Instead use ag_args_fit and make generic
+        max_features = params.pop(
+            "_max_features", None
+        )  # FIXME: `_max_features` is a hack. Instead use ag_args_fit and make generic
         num_features = len(X.columns)
         if max_features is not None and num_features > max_features:
             raise AssertionError(
@@ -172,7 +173,11 @@ class MultiModalPredictorModel(AbstractModel):
             enable_progress_bar = True
         num_gpus = kwargs.get("num_gpus", None)
         if sample_weight is not None:  # TODO: support
-            logger.log(15, "sample_weight not yet supported for MultiModalPredictorModel, " "this model will ignore them in training.")
+            logger.log(
+                15,
+                "sample_weight not yet supported for MultiModalPredictorModel, "
+                "this model will ignore them in training.",
+            )
 
         # Need to deep copy to avoid altering outer context
         X = X.copy()
@@ -265,14 +270,10 @@ class MultiModalPredictorModel(AbstractModel):
 
     def _get_default_resources(self):
         num_cpus = ResourceManager.get_cpu_count()
-        num_gpus = min(ResourceManager.get_gpu_count_torch(), 1)  # Use single gpu training by default. Consider to revise it later.
+        num_gpus = min(
+            ResourceManager.get_gpu_count_torch(), 1
+        )  # Use single gpu training by default. Consider to revise it later.
         return num_cpus, num_gpus
-
-    def get_minimum_resources(self, is_gpu_available=False) -> Dict[str, int]:
-        return {
-            "num_cpus": 1,
-            "num_gpus": 1,
-        }
 
     def _construct_column_types(self) -> dict:
         # Construct feature types input to MultimodalPredictor

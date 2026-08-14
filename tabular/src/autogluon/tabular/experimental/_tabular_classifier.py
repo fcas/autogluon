@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List
-
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.multiclass import unique_labels
@@ -18,7 +16,7 @@ class TabularClassifier(BaseEstimator, ClassifierMixin, ScikitMixin):
         self,
         eval_metric: str | Scorer = None,
         time_limit: float = None,
-        presets: List[str] | str = None,
+        presets: list[str] | str = None,
         hyperparameters: dict | str = None,
         path: str = None,
         verbosity: int = 2,
@@ -67,7 +65,9 @@ class TabularClassifier(BaseEstimator, ClassifierMixin, ScikitMixin):
         # Input validation
         X = check_array(X)
         if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"Inconsistent number of features between fit and predict calls: ({self.n_features_in_}, {X.shape[1]})")
+            raise ValueError(
+                f"Inconsistent number of features between fit and predict calls: ({self.n_features_in_}, {X.shape[1]})"
+            )
 
         data = pd.DataFrame(X)
         y_pred = self.predictor_.predict(data=data).to_numpy()

@@ -1,27 +1,40 @@
+from __future__ import annotations
+
 from pprint import pformat
-from typing import Type, Union
+from typing import Any, Sequence, Type
+
+import numpy as np
 
 from .abstract import TimeSeriesScorer
-from .point import MAE, MAPE, MASE, MSE, RMSE, RMSLE, RMSSE, SMAPE, WAPE
-from .quantile import SQL, WQL
+from .point import BIAS, MAE, MAEB, MAPE, MASE, MSE, RMSE, RMSLE, RMSSE, SMAPE, WAPE, WAPEB, WCD
+from .quantile import MQL, SQL, WQL
 
 __all__ = [
+    "TimeSeriesScorer",
+    "check_get_evaluation_metric",
+    "BIAS",
     "MAE",
+    "MAEB",
     "MAPE",
     "MASE",
     "SMAPE",
     "MSE",
+    "MQL",
     "RMSE",
     "RMSLE",
     "RMSSE",
     "SQL",
     "WAPE",
+    "WAPEB",
+    "WCD",
     "WQL",
+    "AVAILABLE_METRICS",
+    "METRIC_ALIASES",
 ]
 
 DEFAULT_METRIC_NAME = "WQL"
 
-AVAILABLE_METRICS = {
+AVAILABLE_METRICS: dict[str, Type[TimeSeriesScorer]] = {
     "MASE": MASE,
     "MAPE": MAPE,
     "SMAPE": SMAPE,
@@ -29,10 +42,32 @@ AVAILABLE_METRICS = {
     "RMSLE": RMSLE,
     "RMSSE": RMSSE,
     "WAPE": WAPE,
+    "WAPEB": WAPEB,
     "SQL": SQL,
     "WQL": WQL,
+    "MQL": MQL,
     "MSE": MSE,
     "MAE": MAE,
+    "MAEB": MAEB,
+    "BIAS": BIAS,
+}
+
+# Provide lowercase aliases for metrics for consistency with autogluon.tabular
+METRIC_ALIASES: dict[str, str] = {
+    "mean_absolute_error": "MAE",
+    "mean_squared_error": "MSE",
+    "root_mean_squared_error": "RMSE",
+    "root_mean_squared_logarithmic_error": "RMSLE",
+    "mean_absolute_percentage_error": "MAPE",
+    "symmetric_mean_absolute_percentage_error": "SMAPE",
+    "mean_absolute_scaled_error": "MASE",
+    "root_mean_squared_scaled_error": "RMSSE",
+    "weighted_absolute_percentage_error": "WAPE",
+    "weighted_quantile_loss": "WQL",
+    "scaled_quantile_loss": "SQL",
+    "mean_quantile_loss": "MQL",
+    "mean_absolute_error_with_bias": "MAEB",
+    "weighted_absolute_percentage_error_with_bias": "WAPEB",
 }
 
 # For backward compatibility
@@ -40,28 +75,65 @@ DEPRECATED_METRICS = {
     "mean_wQuantileLoss": "WQL",
 }
 
+# Experimental metrics that are not yet user facing
+EXPERIMENTAL_METRICS: dict[str, Type[TimeSeriesScorer]] = {
+    "WCD": WCD,
+}
+
 
 def check_get_evaluation_metric(
-    eval_metric: Union[str, TimeSeriesScorer, Type[TimeSeriesScorer], None] = None
+    eval_metric: str | TimeSeriesScorer | Type[TimeSeriesScorer] | None,
+    prediction_length: int,
+    seasonal_period: int | None = None,
+    horizon_weight: Sequence[float] | np.ndarray | None = None,
 ) -> TimeSeriesScorer:
+    """Factory method for TimeSeriesScorer objects.
+
+    Returns
+    -------
+    scorer
+        A `TimeSeriesScorer` object based on the provided `eval_metric`.
+
+        `scorer.prediction_length` is always set to the `prediction_length` provided to this method.
+
+        If `seasonal_period` is not `None`, then `scorer.seasonal_period` is set to this value. Otherwise the original
+        value of `seasonal_period` is kept.
+
+        If `horizon_weight` is not `None`, then `scorer.horizon_weight` is set to this value. Otherwise the original
+        value of `horizon_weight` is kept.
+    """
+    scorer: TimeSeriesScorer
+    metric_kwargs: dict[str, Any] = dict(
+        prediction_length=prediction_length, seasonal_period=seasonal_period, horizon_weight=horizon_weight
+    )
     if isinstance(eval_metric, TimeSeriesScorer):
-        eval_metric = eval_metric
+        scorer = eval_metric
+        scorer.prediction_length = prediction_length
+        if seasonal_period is not None:
+            scorer.seasonal_period = seasonal_period
+        if horizon_weight is not None:
+            scorer.horizon_weight = scorer.check_get_horizon_weight(
+                horizon_weight, prediction_length=prediction_length
+            )
     elif isinstance(eval_metric, type) and issubclass(eval_metric, TimeSeriesScorer):
         # e.g., user passed `eval_metric=CustomMetric` instead of `eval_metric=CustomMetric()`
-        eval_metric = eval_metric()
+        scorer = eval_metric(**metric_kwargs)
     elif isinstance(eval_metric, str):
-        eval_metric = DEPRECATED_METRICS.get(eval_metric, eval_metric)
-        if eval_metric.upper() not in AVAILABLE_METRICS:
+        metric_name = METRIC_ALIASES.get(eval_metric, DEPRECATED_METRICS.get(eval_metric, eval_metric)).upper()
+        if metric_name in AVAILABLE_METRICS:
+            scorer = AVAILABLE_METRICS[metric_name](**metric_kwargs)
+        elif metric_name in EXPERIMENTAL_METRICS:
+            scorer = EXPERIMENTAL_METRICS[metric_name](**metric_kwargs)
+        else:
             raise ValueError(
                 f"Time series metric {eval_metric} not supported. Available metrics are:\n"
                 f"{pformat(sorted(AVAILABLE_METRICS.keys()))}"
             )
-        eval_metric = AVAILABLE_METRICS[eval_metric.upper()]()
     elif eval_metric is None:
-        eval_metric = AVAILABLE_METRICS[DEFAULT_METRIC_NAME]()
+        scorer = AVAILABLE_METRICS[DEFAULT_METRIC_NAME](**metric_kwargs)
     else:
         raise ValueError(
             f"eval_metric must be of type str, TimeSeriesScorer or None "
             f"(received eval_metric = {eval_metric} of type {type(eval_metric)})"
         )
-    return eval_metric
+    return scorer

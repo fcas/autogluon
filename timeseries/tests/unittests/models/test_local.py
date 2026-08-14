@@ -1,29 +1,19 @@
 import logging
-from typing import Dict
+import multiprocessing as mp
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 import pytest
+from statsforecast.models import CrostonClassic, CrostonOptimized, CrostonSBA
 
 from autogluon.timeseries import TimeSeriesDataFrame
 from autogluon.timeseries.models.local import (
-    ADIDAModel,
-    AutoARIMAModel,
-    AutoCESModel,
-    AutoETSModel,
     AverageModel,
-    CrostonClassicModel,
-    CrostonOptimizedModel,
-    CrostonSBAModel,
-    DynamicOptimizedThetaModel,
-    ETSModel,
-    IMAPAModel,
-    NaiveModel,
+    CrostonModel,
     NPTSModel,
     SeasonalAverageModel,
     SeasonalNaiveModel,
-    ThetaModel,
-    ZeroModel,
 )
 from autogluon.timeseries.models.local.statsforecast import AbstractConformalizedStatsForecastModel
 
@@ -34,52 +24,24 @@ from ..common import (
     get_data_frame_with_item_index,
     to_supported_pandas_freq,
 )
+from .common import ALL_LOCAL_MODELS
 
-# models accepting seasonal_period
-SEASONAL_TESTABLE_MODELS = [
-    AutoARIMAModel,
-    AutoETSModel,
-    AutoCESModel,
-    AverageModel,
-    DynamicOptimizedThetaModel,
-    ETSModel,
-    ThetaModel,
-    NaiveModel,
-    NPTSModel,
-    SeasonalAverageModel,
-    SeasonalNaiveModel,
-]
-# intermittent demand models do not accept seasonal_period
-NONSEASONAL_TESTABLE_MODELS = [
-    ADIDAModel,
-    ZeroModel,
-    CrostonClassicModel,
-    CrostonSBAModel,
-    CrostonOptimizedModel,
-    IMAPAModel,
-]
-TESTABLE_MODELS = SEASONAL_TESTABLE_MODELS + NONSEASONAL_TESTABLE_MODELS
-
-
-# Restrict to single core for faster training on small datasets
 DEFAULT_HYPERPARAMETERS = {"n_jobs": 1, "use_fallback_model": False}
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
-def test_when_local_model_is_saved_and_loaded_then_model_can_predict(model_class, temp_model_path):
-    model = model_class(path=temp_model_path, hyperparameters=DEFAULT_HYPERPARAMETERS, freq=DUMMY_TS_DATAFRAME.freq)
+def test_when_local_model_is_saved_and_loaded_then_model_can_predict(local_model_class, temp_model_path):
+    model = local_model_class(path=temp_model_path, freq=DUMMY_TS_DATAFRAME.freq)
     model.fit(train_data=DUMMY_TS_DATAFRAME)
     model.save()
     loaded_model = model.__class__.load(path=model.path)
     loaded_model.predict(data=DUMMY_TS_DATAFRAME)
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
 @pytest.mark.parametrize(
     "hyperparameters", [{}, {"seasonal_period": 5}, {"seasonal_period": 5, "dummy_argument": "a"}]
 )
-def test_when_local_model_saved_then_local_model_args_are_saved(model_class, hyperparameters, temp_model_path):
-    model = model_class(path=temp_model_path, hyperparameters=hyperparameters)
+def test_when_local_model_saved_then_local_model_args_are_saved(local_model_class, hyperparameters, temp_model_path):
+    model = local_model_class(path=temp_model_path, hyperparameters=hyperparameters)
     model.fit(train_data=DUMMY_TS_DATAFRAME)
     model.save()
 
@@ -94,10 +56,7 @@ def get_seasonal_period_from_fitted_local_model(model):
         return model._local_model_args["seasonal_period"]
 
 
-@pytest.mark.parametrize("model_class", SEASONAL_TESTABLE_MODELS)
-@pytest.mark.parametrize(
-    "hyperparameters", [{**DEFAULT_HYPERPARAMETERS, "seasonal_period": None}, DEFAULT_HYPERPARAMETERS]
-)
+@pytest.mark.parametrize("hyperparameters", [{"seasonal_period": None}, {}])
 @pytest.mark.parametrize(
     "freqstr, ts_length, expected_seasonal_period",
     [
@@ -109,7 +68,7 @@ def get_seasonal_period_from_fitted_local_model(model):
     ],
 )
 def test_when_seasonal_period_is_set_to_none_then_inferred_period_is_used(
-    model_class,
+    seasonal_local_model_class,
     hyperparameters,
     temp_model_path,
     freqstr,
@@ -117,13 +76,14 @@ def test_when_seasonal_period_is_set_to_none_then_inferred_period_is_used(
     expected_seasonal_period,
 ):
     train_data = get_data_frame_with_item_index(["A", "B", "C"], data_length=ts_length, freq=freqstr)
-    model = model_class(path=temp_model_path, prediction_length=3, hyperparameters=hyperparameters)
+    model = seasonal_local_model_class(
+        path=temp_model_path, prediction_length=3, freq=train_data.freq, hyperparameters=hyperparameters
+    )
 
     model.fit(train_data=train_data)
     assert get_seasonal_period_from_fitted_local_model(model) == expected_seasonal_period
 
 
-@pytest.mark.parametrize("model_class", SEASONAL_TESTABLE_MODELS)
 @pytest.mark.parametrize(
     "freqstr, ts_length, provided_seasonal_period",
     [
@@ -135,25 +95,28 @@ def test_when_seasonal_period_is_set_to_none_then_inferred_period_is_used(
     ],
 )
 def test_when_seasonal_period_is_provided_then_inferred_period_is_overridden(
-    model_class,
+    seasonal_local_model_class,
     temp_model_path,
     freqstr,
     ts_length,
     provided_seasonal_period,
 ):
     train_data = get_data_frame_with_item_index(["A", "B", "C"], data_length=ts_length, freq=freqstr)
-    model = model_class(
+    model = seasonal_local_model_class(
         path=temp_model_path,
         prediction_length=3,
-        hyperparameters={"seasonal_period": provided_seasonal_period, **DEFAULT_HYPERPARAMETERS},
+        hyperparameters={
+            "seasonal_period": provided_seasonal_period,
+        },
     )
 
     model.fit(train_data=train_data)
     assert get_seasonal_period_from_fitted_local_model(model) == provided_seasonal_period
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
+@pytest.mark.parametrize("model_class", ALL_LOCAL_MODELS)
 def test_when_invalid_model_arguments_provided_then_model_ignores_them(model_class, temp_model_path, caplog):
+    # Do not use a fixture as argument handling is mocked in model fixtures
     model = model_class(
         path=temp_model_path,
         prediction_length=3,
@@ -164,23 +127,31 @@ def test_when_invalid_model_arguments_provided_then_model_ignores_them(model_cla
         assert "bad_argument" not in model._local_model_args
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
-@pytest.mark.parametrize("n_jobs", [0.5, 3])
-def test_when_local_model_saved_then_n_jobs_is_saved(model_class, n_jobs, temp_model_path):
-    model = model_class(path=temp_model_path, hyperparameters={"n_jobs": n_jobs})
-    model.save()
-
-    loaded_model = model.__class__.load(path=model.path)
-    assert model.n_jobs == loaded_model.n_jobs
+@pytest.mark.parametrize(
+    "input_n_jobs, joblib_n_jobs",
+    [
+        (0.5, max(1, int(0.5 * mp.cpu_count()))),
+        (3, min(3, mp.cpu_count())),
+        (-1, -1),
+    ],
+)
+def test_when_n_jobs_hyperparameter_provided_then_joblib_receives_it(input_n_jobs, joblib_n_jobs, temp_model_path):
+    model = AverageModel(path=temp_model_path, hyperparameters={"n_jobs": input_n_jobs})
+    with mock.patch("joblib.parallel.Parallel.__init__") as mock_parallel:
+        try:
+            model.fit(train_data=DUMMY_TS_DATAFRAME)
+            model.predict(DUMMY_TS_DATAFRAME)
+        except TypeError:
+            pass
+        assert mock_parallel.call_args[1]["n_jobs"] == joblib_n_jobs
 
 
 def failing_predict(*args, **kwargs):
     raise RuntimeError("Custom error message")
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
-def test_when_fallback_model_disabled_and_model_fails_then_exception_is_raised(temp_model_path, model_class):
-    model = model_class(
+def test_when_fallback_model_disabled_and_model_fails_then_exception_is_raised(temp_model_path, local_model_class):
+    model = local_model_class(
         path=temp_model_path, hyperparameters={"use_fallback_model": False, "n_jobs": 1}, freq=DUMMY_TS_DATAFRAME.freq
     )
     model.fit(train_data=DUMMY_TS_DATAFRAME)
@@ -189,9 +160,8 @@ def test_when_fallback_model_disabled_and_model_fails_then_exception_is_raised(t
         model.predict(DUMMY_TS_DATAFRAME)
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
-def test_when_fallback_model_enabled_and_model_fails_then_no_exception_is_raised(temp_model_path, model_class):
-    model = model_class(
+def test_when_fallback_model_enabled_and_model_fails_then_no_exception_is_raised(temp_model_path, local_model_class):
+    model = local_model_class(
         path=temp_model_path, hyperparameters={"use_fallback_model": True, "n_jobs": 1}, freq=DUMMY_TS_DATAFRAME.freq
     )
     model.fit(train_data=DUMMY_TS_DATAFRAME)
@@ -278,10 +248,10 @@ def test_when_npts_fit_with_default_seasonal_features_then_predictions_match_glu
 
 
 class MockConformalModel(AbstractConformalizedStatsForecastModel):
-    def _get_point_forecast(self, time_series: pd.Series, local_model_args: Dict):
+    def _get_point_forecast(self, time_series: pd.Series, local_model_args: dict):
         return np.ones(self.prediction_length)
 
-    def _get_nonconformity_scores(self, time_series: pd.Series, local_model_args: Dict):
+    def _get_nonconformity_scores(self, time_series: pd.Series, local_model_args: dict):
         scores = super()._get_nonconformity_scores(time_series, local_model_args)
         self.returned_nonconformity_scores = scores
         return scores
@@ -361,21 +331,16 @@ def test_when_conformalized_model_called_then_nonconformity_score_values_correct
     assert np.allclose(expected_scores, returned_scores)
 
 
-@pytest.mark.parametrize("model_class", NONSEASONAL_TESTABLE_MODELS)
 @pytest.mark.parametrize("prediction_length", [1, 3, 10])
-@pytest.mark.parametrize("positive_only", [True, False])
 def test_when_intermittent_models_fit_then_values_are_lower_bounded(
-    model_class, prediction_length, positive_only, temp_model_path
+    intermittent_local_model_class, prediction_length, temp_model_path
 ):
-    data = DUMMY_VARIABLE_LENGTH_TS_DATAFRAME
-    if positive_only:
-        data[data < 0] = 0.0
-    else:
-        # make sure there are some negative values
-        for c in data.columns:
-            data[c] *= np.random.randn(*data[c].values.shape)
+    data = DUMMY_VARIABLE_LENGTH_TS_DATAFRAME.copy(deep=True)
 
-    model = model_class(
+    # intermittent demand models only handle positive values
+    data[data < 0] = 0.0
+
+    model = intermittent_local_model_class(
         path=temp_model_path,
         prediction_length=prediction_length,
         hyperparameters=DEFAULT_HYPERPARAMETERS,
@@ -385,17 +350,15 @@ def test_when_intermittent_models_fit_then_values_are_lower_bounded(
     predictions = model.predict(data=data)
 
     for item_id in data.index.levels[0]:
-        if positive_only:
-            predictions.loc[item_id].values.min() >= 0
-        else:
-            predictions.loc[item_id].values.min() >= data.loc[item_id].values.min()
+        assert predictions.loc[item_id].values.min() >= 0
 
 
-@pytest.mark.parametrize("model_class", TESTABLE_MODELS)
 @pytest.mark.parametrize("prediction_length", [1, 3])
-def test_when_local_models_fit_then_quantiles_are_present_and_ranked(model_class, prediction_length, temp_model_path):
+def test_when_local_models_fit_then_quantiles_are_present_and_ranked(
+    local_model_class, prediction_length, temp_model_path
+):
     data = get_data_frame_with_item_index(["B", "A", "X"])
-    model = model_class(
+    model = local_model_class(
         path=temp_model_path,
         prediction_length=prediction_length,
         hyperparameters=DEFAULT_HYPERPARAMETERS,
@@ -408,3 +371,34 @@ def test_when_local_models_fit_then_quantiles_are_present_and_ranked(model_class
 
     assert set(model.quantile_levels) == set(float(q) for q in quantile_columns)
     assert np.diff(predictions[quantile_columns].values, axis=1).min() >= 0
+
+
+def test_when_leading_nans_are_present_then_seasonal_naive_can_forecast(temp_model_path):
+    data = get_data_frame_with_item_index(item_list=["A"], data_length=30, freq="D")
+    data.iloc[:-3] = float("nan")
+    model = SeasonalNaiveModel(
+        path=temp_model_path, prediction_length=7, hyperparameters={**DEFAULT_HYPERPARAMETERS, "seasonal_period": 7}
+    )
+    model.fit(train_data=data)
+    predictions = model.predict(data)
+
+    assert not pd.isna(predictions).any(axis=None)
+
+
+@pytest.mark.parametrize(
+    "hyperparameters, expected_cls",
+    [
+        ({}, CrostonSBA),
+        ({"variant": "SBA"}, CrostonSBA),
+        ({"variant": "Classic"}, CrostonClassic),
+        ({"variant": "Optimized"}, CrostonOptimized),
+    ],
+)
+def test_when_variant_hyperparameter_provided_to_croston_model_then_correct_model_class_is_created(
+    hyperparameters, expected_cls
+):
+    data = DUMMY_TS_DATAFRAME.copy()
+    model = CrostonModel(freq=data.freq, hyperparameters=hyperparameters)
+    model.fit(train_data=data)
+    model_cls = model._get_model_type(model._local_model_args.get("variant"))
+    assert model_cls is expected_cls

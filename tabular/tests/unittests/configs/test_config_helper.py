@@ -5,6 +5,7 @@ from sklearn.feature_extraction.text import CountVectorizer
 from autogluon.features import TextNgramFeatureGenerator
 from autogluon.tabular.configs.config_helper import ConfigBuilder, FeatureGeneratorBuilder
 from autogluon.tabular.models import KNNModel
+from autogluon.tabular.registry import ag_model_registry
 
 
 def test_presets():
@@ -25,10 +26,16 @@ def test_presets():
 
 
 def test_presets_invalid_option():
-    with pytest.raises(AssertionError, match=r"The following presets are not recognized: .'unknown1'. - use one of the valid presets: .*"):
+    with pytest.raises(
+        AssertionError,
+        match=r"The following presets are not recognized: .'unknown1'. - use one of the valid presets: .*",
+    ):
         ConfigBuilder().presets("unknown1").build()
 
-    with pytest.raises(AssertionError, match=r"The following presets are not recognized: .'unknown2', 'unknown3'. - use one of the valid presets: .*"):
+    with pytest.raises(
+        AssertionError,
+        match=r"The following presets are not recognized: .'unknown2', 'unknown3'. - use one of the valid presets: .*",
+    ):
         ConfigBuilder().presets(["best_quality", "unknown2", "unknown3"]).build()
 
 
@@ -58,32 +65,10 @@ def test_excluded_model_types_invalid_option():
 
 
 def test_included_model_types():
-    expected_config = dict(
-        excluded_model_types=[
-            "XT",
-            "KNN",
-            "GBM",
-            "CAT",
-            "XGB",
-            "NN_TORCH",
-            "LR",
-            "FASTAI",
-            "TRANSF",
-            "AG_TEXT_NN",
-            "AG_IMAGE_NN",
-            "AG_AUTOMM",
-            "FT_TRANSFORMER",
-            "TABPFN",
-            "FASTTEXT",
-            "IM_RULEFIT",
-            "IM_GREEDYTREE",
-            "IM_FIGS",
-            "IM_HSTREE",
-            "IM_BOOSTEDRULES",
-            "VW",
-            "DUMMY",
-        ]
-    )
+    model_keys = ag_model_registry.keys
+    model_keys_no_rf = [k for k in model_keys if k not in ["RF", "ENS_WEIGHTED", "SIMPLE_ENS_WEIGHTED"]]
+
+    expected_config = dict(excluded_model_types=model_keys_no_rf)
     actual_config = ConfigBuilder().included_model_types("RF").build()
     assert actual_config == expected_config
 
@@ -93,72 +78,30 @@ def test_included_model_types():
     actual_config = ConfigBuilder().included_model_types(["RF", "RF"]).build()
     assert actual_config == expected_config
 
-    expected_config = dict(
-        excluded_model_types=[
-            "XT",
-            "KNN",
-            "GBM",
-            "CAT",
-            "XGB",
-            "NN_TORCH",
-            "FASTAI",
-            "TRANSF",
-            "AG_TEXT_NN",
-            "AG_IMAGE_NN",
-            "AG_AUTOMM",
-            "FT_TRANSFORMER",
-            "TABPFN",
-            "FASTTEXT",
-            "IM_RULEFIT",
-            "IM_GREEDYTREE",
-            "IM_FIGS",
-            "IM_HSTREE",
-            "IM_BOOSTEDRULES",
-            "VW",
-            "DUMMY",
-        ]
-    )
+    model_keys_no_lr = [k for k in model_keys_no_rf if k != "LR"]
+    expected_config = dict(excluded_model_types=model_keys_no_lr)
     actual_config = ConfigBuilder().included_model_types(["RF", "LR"]).build()
     assert actual_config == expected_config
 
     class CustomKNN(KNNModel):
         pass
 
-    expected_config = dict(
-        excluded_model_types=[
-            "XT",
-            "KNN",
-            "GBM",
-            "CAT",
-            "XGB",
-            "NN_TORCH",
-            "LR",
-            "FASTAI",
-            "TRANSF",
-            "AG_TEXT_NN",
-            "AG_IMAGE_NN",
-            "AG_AUTOMM",
-            "FT_TRANSFORMER",
-            "TABPFN",
-            "FASTTEXT",
-            "IM_RULEFIT",
-            "IM_GREEDYTREE",
-            "IM_FIGS",
-            "IM_HSTREE",
-            "IM_BOOSTEDRULES",
-            "VW",
-            "DUMMY",
-        ]
-    )
+    expected_config = dict(excluded_model_types=model_keys_no_rf)
     actual_config = ConfigBuilder().included_model_types([CustomKNN, "RF"]).build()
     assert actual_config == expected_config
 
 
 def test_included_model_types_invalid_option():
-    with pytest.raises(AssertionError, match=r"The following model types are not recognized: .'unknown1'. - use one of the valid models: .*"):
+    with pytest.raises(
+        AssertionError,
+        match=r"The following model types are not recognized: .'unknown1'. - use one of the valid models: .*",
+    ):
         ConfigBuilder().included_model_types("unknown1").build()
 
-    with pytest.raises(AssertionError, match=r"The following model types are not recognized: .'unknown2', 'unknown3'. - use one of the valid models: .*"):
+    with pytest.raises(
+        AssertionError,
+        match=r"The following model types are not recognized: .'unknown2', 'unknown3'. - use one of the valid models: .*",
+    ):
         ConfigBuilder().included_model_types(["RF", "unknown2", "unknown3"]).build()
 
 
@@ -203,7 +146,10 @@ def test_hyperparameters__invalid_option():
     with pytest.raises(AssertionError, match=r"unknown is not one of the valid presets .*"):
         ConfigBuilder().hyperparameters("unknown").build()
 
-    with pytest.raises(AssertionError, match=r"The following model types are not recognized: .'unknown'. - use one of the valid models: .*"):
+    with pytest.raises(
+        AssertionError,
+        match=r"The following model types are not recognized: .'unknown'. - use one of the valid models: .*",
+    ):
         ConfigBuilder().hyperparameters({"unknown": []}).build()
 
 
@@ -247,7 +193,9 @@ def test_holdout_frac():
 def test_hyperparameter_tune_kwargs():
     assert ConfigBuilder().hyperparameter_tune_kwargs("auto").build() == dict(hyperparameter_tune_kwargs="auto")
     assert ConfigBuilder().hyperparameter_tune_kwargs("random").build() == dict(hyperparameter_tune_kwargs="random")
-    assert ConfigBuilder().hyperparameter_tune_kwargs({"props": 42}).build() == dict(hyperparameter_tune_kwargs={"props": 42})
+    assert ConfigBuilder().hyperparameter_tune_kwargs({"props": 42}).build() == dict(
+        hyperparameter_tune_kwargs={"props": 42}
+    )
     with pytest.raises(AssertionError, match=r"unknown string must be one of .*"):
         ConfigBuilder().hyperparameter_tune_kwargs("unknown").build()
     with pytest.raises(ValueError, match=r"hyperparameter_tune_kwargs must be either str: .* or dict"):

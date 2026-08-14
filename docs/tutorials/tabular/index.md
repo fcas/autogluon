@@ -17,10 +17,22 @@ For standard datasets that are represented as tables (stored as CSV file, parque
   Essential information about the most important settings for tabular prediction.
 :::
 
+:::{grid-item-card} How It Works
+  :link: how-it-works.html
+
+  A deep dive of how AutoGluon works under-the-hood.
+:::
+
 :::{grid-item-card} In-depth
   :link: tabular-indepth.html
 
   In-depth tutorial on controlling various aspects of model fitting.
+:::
+
+:::{grid-item-card} Foundational Models
+  :link: tabular-foundational-models.html
+
+  Tutorial on using the foundational models.
 :::
 
 :::{grid-item-card} Data Tables Containing Image, Text, and Tabular
@@ -77,6 +89,12 @@ For standard datasets that are represented as tables (stored as CSV file, parque
   Tutorial on optimizing the predictor artifact for production deployment.
 :::
 
+:::{grid-item-card} Hyperparameter Optimization
+  :link: advanced/tabular-hpo.html
+
+  Use hyperparameter optimization in AutoGluon.
+:::
+
 ::::
 
 ```{toctree}
@@ -87,6 +105,8 @@ hidden: true
 
 Essentials <tabular-essentials>
 In Depth <tabular-indepth>
+Foundational Models <tabular-foundational-models>
+How It Works <how-it-works>
 Feature Engineering <tabular-feature-engineering>
 Tabular + Text + Images <tabular-multimodal>
 Advanced <advanced/index>

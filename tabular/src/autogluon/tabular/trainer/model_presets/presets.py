@@ -1,9 +1,17 @@
+from __future__ import annotations
+
 import copy
 import inspect
 import logging
 from collections import defaultdict
 
+from packaging import version
+
 from autogluon.common.model_filter import ModelFilter
+from autogluon.common.utils.hyperparameter_utils import (
+    get_deprecated_lightgbm_large_hyperparameters,
+    get_hyperparameter_str_deprecation_msg,
+)
 from autogluon.core.constants import (
     AG_ARGS,
     AG_ARGS_ENSEMBLE,
@@ -16,143 +24,16 @@ from autogluon.core.constants import (
 )
 from autogluon.core.models import (
     AbstractModel,
-    DummyModel,
-    GreedyWeightedEnsembleModel,
-    SimpleWeightedEnsembleModel,
     StackerEnsembleModel,
 )
 from autogluon.core.trainer.utils import process_hyperparameters
 
-from ...models import (
-    BoostedRulesModel,
-    CatBoostModel,
-    FastTextModel,
-    FigsModel,
-    FTTransformerModel,
-    GreedyTreeModel,
-    HSTreeModel,
-    ImagePredictorModel,
-    KNNModel,
-    LGBModel,
-    LinearModel,
-    MultiModalPredictorModel,
-    NNFastAiTabularModel,
-    RFModel,
-    RuleFitModel,
-    TabPFNModel,
-    TabularNeuralNetTorchModel,
-    TextPredictorModel,
-    VowpalWabbitModel,
-    XGBoostModel,
-    XTModel,
-)
-from ...models.tab_transformer.tab_transformer_model import TabTransformerModel
-from .presets_custom import get_preset_custom
+from ...registry import ag_model_registry
+from ...version import __version__
 
 logger = logging.getLogger(__name__)
 
-# Higher values indicate higher priority, priority dictates the order models are trained for a given level.
-DEFAULT_MODEL_PRIORITY = dict(
-    TABPFN=110,  # highest priority due to its very fast training time
-    KNN=100,
-    GBM=90,
-    RF=80,
-    CAT=70,
-    XT=60,
-    FASTAI=50,
-    XGB=40,
-    LR=30,
-    NN_TORCH=25,
-    VW=10,
-    FASTTEXT=0,
-    AG_TEXT_NN=0,
-    AG_IMAGE_NN=0,
-    AG_AUTOMM=0,
-    TRANSF=0,
-    custom=0,
-    # interpretable models
-    IM_RULEFIT=0,
-    IM_GREEDYTREE=0,
-    IM_FIGS=0,
-    IM_HSTREE=0,
-    IM_BOOSTEDRULES=0,
-)
-
-# Problem type specific model priority overrides (will update default values in DEFAULT_MODEL_PRIORITY)
-PROBLEM_TYPE_MODEL_PRIORITY = {
-    MULTICLASS: dict(
-        FASTAI=95,
-    ),
-}
-
-DEFAULT_SOFTCLASS_PRIORITY = dict(
-    GBM=100,
-    RF=80,
-    CAT=60,
-    custom=0,
-)
-
 DEFAULT_CUSTOM_MODEL_PRIORITY = 0
-
-MODEL_TYPES = dict(
-    RF=RFModel,
-    XT=XTModel,
-    KNN=KNNModel,
-    GBM=LGBModel,
-    CAT=CatBoostModel,
-    XGB=XGBoostModel,
-    NN_TORCH=TabularNeuralNetTorchModel,
-    LR=LinearModel,
-    FASTAI=NNFastAiTabularModel,
-    TRANSF=TabTransformerModel,
-    AG_TEXT_NN=TextPredictorModel,
-    AG_IMAGE_NN=ImagePredictorModel,
-    AG_AUTOMM=MultiModalPredictorModel,
-    FT_TRANSFORMER=FTTransformerModel,
-    TABPFN=TabPFNModel,
-    FASTTEXT=FastTextModel,
-    ENS_WEIGHTED=GreedyWeightedEnsembleModel,
-    SIMPLE_ENS_WEIGHTED=SimpleWeightedEnsembleModel,
-    # interpretable models
-    IM_RULEFIT=RuleFitModel,
-    IM_GREEDYTREE=GreedyTreeModel,
-    IM_FIGS=FigsModel,
-    IM_HSTREE=HSTreeModel,
-    IM_BOOSTEDRULES=BoostedRulesModel,
-    VW=VowpalWabbitModel,
-    DUMMY=DummyModel,
-)
-
-
-# TODO: v1.0 Have this be defined in the model class
-DEFAULT_MODEL_NAMES = {
-    RFModel: "RandomForest",
-    XTModel: "ExtraTrees",
-    KNNModel: "KNeighbors",
-    LGBModel: "LightGBM",
-    CatBoostModel: "CatBoost",
-    XGBoostModel: "XGBoost",
-    TabularNeuralNetTorchModel: "NeuralNetTorch",
-    LinearModel: "LinearModel",
-    NNFastAiTabularModel: "NeuralNetFastAI",
-    TabTransformerModel: "Transformer",
-    TextPredictorModel: "TextPredictor",
-    ImagePredictorModel: "ImagePredictor",
-    MultiModalPredictorModel: "MultiModalPredictor",
-    FTTransformerModel: "FTTransformer",
-    TabPFNModel: "TabPFN",
-    FastTextModel: "FastText",
-    VowpalWabbitModel: "VowpalWabbit",
-    GreedyWeightedEnsembleModel: "WeightedEnsemble",
-    SimpleWeightedEnsembleModel: "WeightedEnsemble",
-    # Interpretable models
-    RuleFitModel: "RuleFit",
-    GreedyTreeModel: "GreedyTree",
-    FigsModel: "Figs",
-    HSTreeModel: "HierarchicalShrinkageTree",
-    BoostedRulesModel: "BoostedRules",
-}
-
 
 VALID_AG_ARGS_KEYS = {
     "name",
@@ -218,15 +99,18 @@ def get_preset_models(
         invalid_name_set.update(invalid_model_names)
 
     if default_priorities is None:
-        default_priorities = copy.deepcopy(DEFAULT_MODEL_PRIORITY)
-        if problem_type in PROBLEM_TYPE_MODEL_PRIORITY:
-            default_priorities.update(PROBLEM_TYPE_MODEL_PRIORITY[problem_type])
+        priority_cls_map = ag_model_registry.priority_map(problem_type=problem_type)
+        default_priorities = {
+            ag_model_registry.key(model_cls): priority for model_cls, priority in priority_cls_map.items()
+        }
 
     level_key = level if level in hyperparameters.keys() else "default"
     if level_key not in hyperparameters.keys() and level_key == "default":
         hyperparameters = {"default": hyperparameters}
     hp_level = hyperparameters[level_key]
-    hp_level = ModelFilter.filter_models(models=hp_level, included_model_types=included_model_types, excluded_model_types=excluded_model_types)
+    hp_level = ModelFilter.filter_models(
+        models=hp_level, included_model_types=included_model_types, excluded_model_types=excluded_model_types
+    )
     model_cfg_priority_dict = defaultdict(list)
     model_type_list = list(hp_level.keys())
     for model_type in model_type_list:
@@ -235,13 +119,7 @@ def get_preset_models(
             models_of_type = [models_of_type]
         model_cfgs_to_process = []
         for model_cfg in models_of_type:
-            if isinstance(model_cfg, str):
-                if model_type == "AG_TEXT_NN" or model_type == "AG_AUTOMM":
-                    model_cfgs_to_process.append({})
-                else:
-                    model_cfgs_to_process += get_preset_custom(name=model_cfg, problem_type=problem_type)
-            else:
-                model_cfgs_to_process.append(model_cfg)
+            model_cfgs_to_process.append(model_cfg)
         for model_cfg in model_cfgs_to_process:
             model_cfg = clean_model_cfg(
                 model_cfg=model_cfg,
@@ -251,7 +129,9 @@ def get_preset_models(
                 ag_args_fit=ag_args_fit,
                 problem_type=problem_type,
             )
-            model_cfg[AG_ARGS]["priority"] = model_cfg[AG_ARGS].get("priority", default_priorities.get(model_type, DEFAULT_CUSTOM_MODEL_PRIORITY))
+            model_cfg[AG_ARGS]["priority"] = model_cfg[AG_ARGS].get(
+                "priority", default_priorities.get(model_type, DEFAULT_CUSTOM_MODEL_PRIORITY)
+            )
             model_priority = model_cfg[AG_ARGS]["priority"]
             # Check if model_cfg is valid
             is_valid = is_model_cfg_valid(model_cfg, level=level, problem_type=problem_type)
@@ -260,7 +140,11 @@ def get_preset_models(
             if is_valid:
                 model_cfg_priority_dict[model_priority].append(model_cfg)
 
-    model_cfg_priority_list = [model for priority in sorted(model_cfg_priority_dict.keys(), reverse=True) for model in model_cfg_priority_dict[priority]]
+    model_cfg_priority_list = [
+        model
+        for priority in sorted(model_cfg_priority_dict.keys(), reverse=True)
+        for model in model_cfg_priority_dict[priority]
+    ]
 
     if not silent:
         logger.log(20, "Model configs that will be trained (in order):")
@@ -280,7 +164,9 @@ def get_preset_models(
         )
         invalid_name_set.add(model.name)
         if "hyperparameter_tune_kwargs" in model_cfg[AG_ARGS]:
-            model_args_fit[model.name] = {"hyperparameter_tune_kwargs": model_cfg[AG_ARGS]["hyperparameter_tune_kwargs"]}
+            model_args_fit[model.name] = {
+                "hyperparameter_tune_kwargs": model_cfg[AG_ARGS]["hyperparameter_tune_kwargs"]
+            }
         if "ag_args_ensemble" in model_cfg and not model_cfg["ag_args_ensemble"]:
             model_cfg.pop("ag_args_ensemble")
         if not silent:
@@ -289,7 +175,10 @@ def get_preset_models(
     return models, model_args_fit
 
 
-def clean_model_cfg(model_cfg: dict, model_type=None, ag_args=None, ag_args_ensemble=None, ag_args_fit=None, problem_type=None):
+def clean_model_cfg(
+    model_cfg: dict, model_type=None, ag_args=None, ag_args_ensemble=None, ag_args_fit=None, problem_type=None
+):
+    model_cfg = _verify_model_cfg(model_cfg=model_cfg, model_type=model_type)
     model_cfg = copy.deepcopy(model_cfg)
     if AG_ARGS not in model_cfg:
         model_cfg[AG_ARGS] = dict()
@@ -298,18 +187,24 @@ def clean_model_cfg(model_cfg: dict, model_type=None, ag_args=None, ag_args_ense
     if model_cfg[AG_ARGS]["model_type"] is None:
         raise AssertionError(f"model_type was not specified for model! Model: {model_cfg}")
     model_type = model_cfg[AG_ARGS]["model_type"]
+    model_types = ag_model_registry.key_to_cls_map()
     if not inspect.isclass(model_type):
-        model_type = MODEL_TYPES[model_type]
+        if model_type not in model_types:
+            raise AssertionError(
+                f"Unknown model type specified in hyperparameters: '{model_type}'. Valid model types: {list(model_types.keys())}"
+            )
+        model_type = model_types[model_type]
     elif not issubclass(model_type, AbstractModel):
         logger.warning(
             f"Warning: Custom model type {model_type} does not inherit from {AbstractModel}. This may lead to instability. Consider wrapping {model_type} with an implementation of {AbstractModel}!"
         )
     else:
-        logger.log(20, f"Custom Model Type Detected: {model_type}")
+        if not ag_model_registry.exists(model_type):
+            logger.log(20, f"Custom Model Type Detected: {model_type}")
     model_cfg[AG_ARGS]["model_type"] = model_type
     model_type_real = model_cfg[AG_ARGS]["model_type"]
     if not inspect.isclass(model_type_real):
-        model_type_real = MODEL_TYPES[model_type_real]
+        model_type_real = model_types[model_type_real]
     default_ag_args = model_type_real._get_default_ag_args()
     if ag_args is not None:
         model_extra_ag_args = ag_args.copy()
@@ -335,6 +230,34 @@ def clean_model_cfg(model_cfg: dict, model_type=None, ag_args=None, ag_args_ense
     return model_cfg
 
 
+def _verify_model_cfg(model_cfg, model_type) -> dict:
+    """
+    Ensures that model_cfg is of the correct type, or else raises an exception.
+    Returns model_cfg
+    """
+    if not isinstance(model_cfg, dict):
+        extra_msg = ""
+        error = True
+        if isinstance(model_cfg, str) and model_cfg == "GBMLarge":
+            extra_msg = get_hyperparameter_str_deprecation_msg()
+            if version.parse(__version__) >= version.parse("1.3.0"):
+                error = True
+                extra_msg = "\n" + extra_msg
+            else:
+                error = False
+                model_cfg = get_deprecated_lightgbm_large_hyperparameters()
+                logger.warning(
+                    f"#######################################################"
+                    f"\nWARNING: {extra_msg}"
+                    f"\n#######################################################"
+                )
+        if error:
+            raise AssertionError(
+                f"Invalid model hyperparameters, expecting dict, but found {type(model_cfg)}! Model Type: {model_type} | Value: {model_cfg}{extra_msg}"
+            )
+    return model_cfg
+
+
 # Check if model is valid
 def is_model_cfg_valid(model_cfg, level=1, problem_type=None):
     is_valid = True
@@ -345,7 +268,9 @@ def is_model_cfg_valid(model_cfg, level=1, problem_type=None):
         is_valid = False  # AG_ARGS is required
     elif model_cfg[AG_ARGS].get("model_type", None) is None:
         is_valid = False  # model_type is required
-    elif model_cfg[AG_ARGS].get("hyperparameter_tune_kwargs", None) and model_cfg[AG_ARGS].get("disable_in_hpo", False):
+    elif model_cfg[AG_ARGS].get("hyperparameter_tune_kwargs", None) and model_cfg[AG_ARGS].get(
+        "disable_in_hpo", False
+    ):
         is_valid = False
     elif not model_cfg[AG_ARGS].get("valid_stacker", True) and level > 1:
         is_valid = False  # Not valid as a stacker model
@@ -371,10 +296,13 @@ def model_factory(
         invalid_name_set = set()
     model_type = model[AG_ARGS]["model_type"]
     if not inspect.isclass(model_type):
-        model_type = MODEL_TYPES[model_type]
+        model_type = ag_model_registry.key_to_cls(model_type)
     name_orig = model[AG_ARGS].get("name", None)
     if name_orig is None:
-        name_main = model[AG_ARGS].get("name_main", DEFAULT_MODEL_NAMES.get(model_type, model_type.__name__))
+        ag_name = model_type.ag_name
+        if ag_name is None:
+            ag_name = model_type.__name__
+        name_main = model[AG_ARGS].get("name_main", ag_name)
         name_prefix = model[AG_ARGS].get("name_prefix", "")
         name_suff = model[AG_ARGS].get("name_suffix", "")
         name_orig = name_prefix + name_main + name_suff
@@ -399,6 +327,16 @@ def model_factory(
     model_params.pop(AG_ARGS, None)
     model_params.pop(AG_ARGS_ENSEMBLE, None)
 
+    extra_ensemble_hyperparameters = copy.deepcopy(model.get(AG_ARGS_ENSEMBLE, dict()))
+
+    # Enable user to pass ensemble hyperparameters via `"ag.ens.fold_fitting_strategy": "sequential_local"`
+    ag_args_ensemble_prefix = "ag.ens."
+    model_param_keys = list(model_params.keys())
+    for key in model_param_keys:
+        if key.startswith(ag_args_ensemble_prefix):
+            key_suffix = key.split(ag_args_ensemble_prefix, 1)[-1]
+            extra_ensemble_hyperparameters[key_suffix] = model_params.pop(key)
+
     model_init_kwargs = dict(
         path=path,
         name=name,
@@ -409,12 +347,17 @@ def model_factory(
 
     if ensemble_kwargs is not None:
         ensemble_kwargs_model = copy.deepcopy(ensemble_kwargs)
-        extra_ensemble_hyperparameters = copy.deepcopy(model.get(AG_ARGS_ENSEMBLE, dict()))
         ensemble_kwargs_model["hyperparameters"] = ensemble_kwargs_model.get("hyperparameters", {})
         if ensemble_kwargs_model["hyperparameters"] is None:
             ensemble_kwargs_model["hyperparameters"] = {}
         ensemble_kwargs_model["hyperparameters"].update(extra_ensemble_hyperparameters)
-        model_init = ensemble_type(path=path, name=name_stacker, model_base=model_type, model_base_kwargs=model_init_kwargs, **ensemble_kwargs_model)
+        model_init = ensemble_type(
+            path=path,
+            name=name_stacker,
+            model_base=model_type,
+            model_base_kwargs=model_init_kwargs,
+            **ensemble_kwargs_model,
+        )
     else:
         model_init = model_type(**model_init_kwargs)
 
@@ -437,13 +380,14 @@ def get_preset_models_softclass(hyperparameters, invalid_model_names: list = Non
         rf_newparams = {"criterion": "squared_error", "ag_args": {"name_suffix": "MSE"}}
         for i in range(len(rf_params)):
             rf_params[i].update(rf_newparams)
-        rf_params = [j for n, j in enumerate(rf_params) if j not in rf_params[(n + 1) :]]  # Remove duplicates which may arise after overwriting criterion
+        rf_params = [
+            j for n, j in enumerate(rf_params) if j not in rf_params[(n + 1) :]
+        ]  # Remove duplicates which may arise after overwriting criterion
         hyperparameters_standard["RF"] = rf_params
     models, model_args_fit = get_preset_models(
         problem_type=SOFTCLASS,
         eval_metric=soft_log_loss,
         hyperparameters=hyperparameters_standard,
-        default_priorities=DEFAULT_SOFTCLASS_PRIORITY,
         invalid_model_names=invalid_model_names,
         **kwargs,
     )

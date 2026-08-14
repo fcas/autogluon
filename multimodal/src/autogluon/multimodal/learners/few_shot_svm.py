@@ -18,19 +18,10 @@ from autogluon.core.metrics import Scorer
 from autogluon.core.utils.loaders import load_pd
 
 from ..constants import CLIP, COLUMN_FEATURES, HF_TEXT, TIMM_IMAGE, Y_PRED, Y_TRUE
-from ..data import BaseDataModule, MultiModalFeaturePreprocessor
-from ..utils import (
-    CustomUnpickler,
-    LogFilter,
-    apply_log_filter,
-    compute_score,
-    data_to_df,
-    extract_from_output,
-    get_available_devices,
-    logits_to_prob,
-    select_model,
-    turn_on_off_feature_column_info,
-)
+from ..data import BaseDataModule, MultiModalFeaturePreprocessor, data_to_df, turn_on_off_feature_column_info
+from ..models import select_model
+from ..optim import compute_score
+from ..utils import LogFilter, apply_log_filter, extract_from_output, get_available_devices, logits_to_prob
 from .base import BaseLearner
 
 logger = logging.getLogger(__name__)
@@ -62,7 +53,7 @@ class FewShotSVMLearner(BaseLearner):
                     "model.hf_text.checkpoint_name": "sentence-transformers/all-mpnet-base-v2",
                     "model.hf_text.pooling_mode": "mean",
                     "env.per_gpu_batch_size": 32,
-                    "env.eval_batch_size_ratio": 4,
+                    "env.inference_batch_size_ratio": 4,
                 }
         presets
             Presets regarding model quality, e.g., best_quality, high_quality, and medium_quality.
@@ -153,9 +144,9 @@ class FewShotSVMLearner(BaseLearner):
     def fit_sanity_check(self):
         feature_column_types = {k: v for k, v in self._column_types.items() if k != self._label_column}
         unique_dtypes = set(feature_column_types.values())
-        assert (
-            len(unique_dtypes) == 1
-        ), f"Few shot SVM learner allows single modality data for now, but detected modalities {unique_dtypes}."
+        assert len(unique_dtypes) == 1, (
+            f"Few shot SVM learner allows single modality data for now, but detected modalities {unique_dtypes}."
+        )
 
     @staticmethod
     def get_svm_per_run(svm: Pipeline):
@@ -554,9 +545,9 @@ class FewShotSVMLearner(BaseLearner):
         data = data_to_df(data=data)
         features = self.extract_embedding(data)
         pred = self._svm.predict(features)
-        assert (
-            self._label_column in data.columns
-        ), f"Label {self._label_column} is not in the data. Cannot perform evaluation without ground truth labels."
+        assert self._label_column in data.columns, (
+            f"Label {self._label_column} is not in the data. Cannot perform evaluation without ground truth labels."
+        )
         y_true = np.array(data[self._label_column])
         metric_data = {Y_PRED: pred, Y_TRUE: y_true}
         if metrics is None:
@@ -589,7 +580,7 @@ class FewShotSVMLearner(BaseLearner):
     ):
         predictor = super().load(path=path, resume=resume, verbosity=verbosity)
         with open(os.path.join(path, "svm.pkl"), "rb") as fp:
-            params = CustomUnpickler(fp).load()
+            params = pickle.load(fp)  # nosec B301
         svm = make_pipeline(StandardScaler(), SVC(gamma="auto"))
         svm.set_params(**params)
         predictor._svm = svm
@@ -627,9 +618,7 @@ class FewShotSVMLearner(BaseLearner):
             logging.info("There is no `best_score` or `total_train_time`. Have you called `predictor.fit()`?")
         else:
             logging.info(
-                f"Here's the model summary:"
-                f""
-                f"The total training time is {timedelta(seconds=self._total_train_time)}"
+                f"Here's the model summary:The total training time is {timedelta(seconds=self._total_train_time)}"
             )
         results = {
             "training_time": self._total_train_time,

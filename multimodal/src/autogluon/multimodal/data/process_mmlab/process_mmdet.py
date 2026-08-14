@@ -6,14 +6,7 @@ import PIL
 from PIL import ImageFile
 from torch import nn
 
-try:
-    from torchvision.transforms import InterpolationMode
-
-    BICUBIC = InterpolationMode.BICUBIC
-except ImportError:
-    BICUBIC = PIL.Image.BICUBIC
-
-from ..utils import is_rois_input
+from ..infer_types import is_rois_input
 from .process_mmlab_base import MMLabProcessor
 
 try:
@@ -178,7 +171,7 @@ class MMDetProcessor(MMLabProcessor):
     def __call__(
         self,
         images: Dict[str, List[str]],
-        feature_modalities: Dict[str, Union[int, float, list]],
+        data_types: Dict[str, Union[int, float, list]],
         is_training: bool,
         load_only: bool = False,
     ) -> Dict:
@@ -189,8 +182,8 @@ class MMDetProcessor(MMLabProcessor):
         ----------
         images
             Images of one sample.
-        feature_modalities
-            The modality of the feature columns.
+        data_types
+            Data types of all columns.
         is_training
             Whether to process images in the training mode.
         load_only

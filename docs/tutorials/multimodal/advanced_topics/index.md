@@ -58,6 +58,18 @@
   Different use cases for continuous training with AutoMM.
 :::
 
+:::{grid-item-card} AutoMM Problem Types and Evaluation Metrics.
+  :link: problem_types_and_metrics.html
+
+  A comprehensive guide to AutoGluon's supported problem types and their evaluation metrics.
+:::
+
+:::{grid-item-card} Multiple Label Columns
+  :link: multiple_label_columns.html
+
+  How to handle multiple label columns with AutoGluon MultiModal.
+:::
+
 ::::
 
 ```{toctree}
@@ -66,6 +78,7 @@ maxdepth: 1
 hidden: true
 ---
 
+problem_types_and_metrics
 hyperparameter_optimization
 continuous_training
 customization
@@ -75,4 +88,5 @@ few_shot_learning
 focal_loss
 presets
 tensorrt
+multiple_label_columns
 ```

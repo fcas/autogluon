@@ -12,7 +12,7 @@ import boto3
 import requests
 import tqdm
 
-from ..constants import AUTOMM, S3_PREFIX
+from ..constants import S3_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +98,7 @@ def download(
                 finally:
                     raise OSError(
                         "Moving downloaded temp file - {}, to {} failed. \
-                        Please retry the download.".format(
-                            src, dst
-                        )
+                        Please retry the download.".format(src, dst)
                     )
 
     else:
@@ -182,7 +180,7 @@ def download(
     if path is None:
         fname = url.split("/")[-1]
         # Empty filenames are invalid
-        assert fname, "Can't construct file-name from this URL. " "Please set the `path` option manually."
+        assert fname, "Can't construct file-name from this URL. Please set the `path` option manually."
     else:
         path = os.path.expanduser(path)
         if os.path.isdir(path):

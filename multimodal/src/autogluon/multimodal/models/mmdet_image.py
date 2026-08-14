@@ -93,7 +93,7 @@ class MMDetAutoModelForObjectDetection(nn.Module):
         freeze_model_layers(self.model, self.frozen_layers)
 
     def _reset_classes(self, classes: list):
-        temp_ckpt_file = f"temp_ckpt_{int(time.time()*1000)}.pth"
+        temp_ckpt_file = f"temp_ckpt_{int(time.time() * 1000)}.pth"
         self._save_weights(temp_ckpt_file)
         self._update_classes(classes)
         self._load_checkpoint()
@@ -500,7 +500,7 @@ class MMDetAutoModelForObjectDetection(nn.Module):
         """
         sd = source_path
 
-        model_dict = torch.load(sd, map_location=torch.device("cpu"))
+        model_dict = torch.load(sd, map_location=torch.device("cpu"), weights_only=True)
         if "state_dict" in model_dict:
             model_dict = model_dict["state_dict"]
         if "model" in model_dict:
@@ -618,5 +618,4 @@ class MMDetAutoModelForObjectDetection(nn.Module):
 
         target_directory = os.path.splitext(sd)[0] + f"_cvt.pth"
         torch.save(data, target_directory)
-
         return target_directory

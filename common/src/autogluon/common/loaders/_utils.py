@@ -10,8 +10,6 @@ from typing import Optional
 
 import boto3
 import numpy as np
-import requests
-import tqdm
 
 S3_PREFIX = "s3://"
 
@@ -39,9 +37,7 @@ if not sys.platform.startswith("win32"):
             finally:
                 raise OSError(
                     "Moving downloaded temp file - {}, to {} failed. \
-                    Please retry the download.".format(
-                        src, dst
-                    )
+                    Please retry the download.".format(src, dst)
                 )
 
 else:
@@ -81,7 +77,12 @@ else:
         src : source file path
         dst : destination file path
         """
-        _handle_errors(ctypes.windll.kernel32.MoveFileExW(_str_to_unicode(src), _str_to_unicode(dst), _windows_default_flags | _MOVEFILE_REPLACE_EXISTING), src)
+        _handle_errors(
+            ctypes.windll.kernel32.MoveFileExW(
+                _str_to_unicode(src), _str_to_unicode(dst), _windows_default_flags | _MOVEFILE_REPLACE_EXISTING
+            ),
+            src,
+        )
 
 
 def sha1sum(filename):
@@ -133,6 +134,9 @@ def download(
     fname
         The file path of the downloaded file.
     """
+    import requests
+    import tqdm
+
     is_s3 = url.startswith(S3_PREFIX)
     if is_s3:
         s3 = boto3.resource("s3")
@@ -148,7 +152,7 @@ def download(
     if path is None:
         fname = url.split("/")[-1]
         # Empty filenames are invalid
-        assert fname, "Can't construct file-name from this URL. " "Please set the `path` option manually."
+        assert fname, "Can't construct file-name from this URL. Please set the `path` option manually."
     else:
         path = os.path.expanduser(path)
         if os.path.isdir(path):
@@ -158,7 +162,10 @@ def download(
     assert retries >= 0, "Number of retries should be at least 0, currently it's {}".format(retries)
 
     if not verify_ssl:
-        warnings.warn("Unverified HTTPS request is being made (verify_ssl=False). " "Adding certificate verification is strongly advised.")
+        warnings.warn(
+            "Unverified HTTPS request is being made (verify_ssl=False). "
+            "Adding certificate verification is strongly advised."
+        )
 
     if overwrite or not os.path.exists(fname) or (sha1_hash and not sha1sum(fname) == sha1_hash):
         dirname = os.path.dirname(os.path.abspath(os.path.expanduser(fname)))
@@ -168,7 +175,7 @@ def download(
             # Disable pyling too broad Exception
             # pylint: disable=W0703
             try:
-                print("Downloading {} from {}...".format(fname, url))
+                logging.info("Downloading {} from {}...".format(fname, url))
                 if is_s3:
                     response = s3.meta.client.head_object(Bucket=s3_bucket_name, Key=s3_key)
                     total_size = int(response.get("ContentLength", 0))
@@ -230,7 +237,11 @@ def download(
                 if retries <= 0:
                     raise e
 
-                print("download failed due to {}, retrying, {} attempt{} left".format(repr(e), retries, "s" if retries > 1 else ""))
+                logging.warning(
+                    "download failed due to {}, retrying, {} attempt{} left".format(
+                        repr(e), retries, "s" if retries > 1 else ""
+                    )
+                )
 
     return fname
 
@@ -264,8 +275,9 @@ def protected_zip_extraction(zipfile_path, sha1_hash, folder):
 
     # Extract the file
     logging.info("Extract files...")
-    with zipfile.ZipFile(zipfile_path, "r") as zip_ref:
-        zip_ref.extractall(folder)
+    from .load_archive import safe_unpack_archive
+
+    safe_unpack_archive(zipfile_path, folder)
 
     if signature:
         # Create the signature

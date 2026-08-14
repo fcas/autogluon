@@ -10,7 +10,18 @@ import lightning.pytorch as pl
 import torch
 from lightning.pytorch.callbacks import BasePredictionWriter
 
-from ..constants import BBOX, LM_TARGET, LOGIT_SCALE, LOGITS, TEMPLATE_LOGITS, WEIGHT
+from ..constants import (
+    AUG_LOGITS,
+    BBOX,
+    LOGIT_SCALE,
+    MULTIMODAL_FEATURES,
+    MULTIMODAL_FEATURES_POST_AUG,
+    MULTIMODAL_FEATURES_PRE_AUG,
+    ORI_LOGITS,
+    VAE_MEAN,
+    VAE_VAR,
+    WEIGHT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +48,9 @@ class DDPPredictionWriter(BasePredictionWriter):
             logging.warning(
                 f"Current predictor's save_path is None, using a default cache folder which may cause an error in prediction I/O. Try init the predictor with a save_path."
             )
-        assert isinstance(
-            output_dir, (str, Path)
-        ), f"Only str and pathlib.Path types are supported for path, but got {output_dir} of type {type(output_dir)}."
+        assert isinstance(output_dir, (str, Path)), (
+            f"Only str and pathlib.Path types are supported for path, but got {output_dir} of type {type(output_dir)}."
+        )
         self.sleep_time = sleep_time
         output_dir = os.path.abspath(os.path.expanduser(output_dir))
         if "spawn" in strategy:
@@ -109,8 +120,8 @@ class DDPPredictionWriter(BasePredictionWriter):
         while (not os.path.exists(sample_indices_file)) or (not os.path.exists(predictions_file)):
             logger.info(f"waiting for rank #{global_rank} to finish saving predictions...")
             time.sleep(self.sleep_time)
-        sample_indices = torch.load(sample_indices_file)
-        predictions = torch.load(predictions_file)
+        sample_indices = torch.load(sample_indices_file, weights_only=True)
+        predictions = torch.load(predictions_file, weights_only=True)
 
         return sample_indices, predictions
 
@@ -146,7 +157,17 @@ class DDPPredictionWriter(BasePredictionWriter):
             return dict()
 
         for k, v in x[0].items():
-            if k in [WEIGHT, LOGIT_SCALE]:  # ignore the keys
+            if k in [
+                WEIGHT,
+                LOGIT_SCALE,
+                MULTIMODAL_FEATURES,
+                MULTIMODAL_FEATURES_PRE_AUG,
+                MULTIMODAL_FEATURES_POST_AUG,
+                ORI_LOGITS,
+                AUG_LOGITS,
+                VAE_MEAN,
+                VAE_VAR,
+            ]:  # ignore the keys
                 continue
             elif isinstance(v, dict):
                 results[k] = self.collate([i[k] for i in x])
@@ -180,9 +201,9 @@ class DDPPredictionWriter(BasePredictionWriter):
             if isinstance(v, dict):
                 results[k] = self.sort(v, indices)
             else:
-                assert len(indices) == len(
-                    v
-                ), f"Size mismatch, {k}: {v} of len {len(v)} and indices {indices} of length {len(indices)}"
+                assert len(indices) == len(v), (
+                    f"Size mismatch, {k}: {v} of len {len(v)} and indices {indices} of length {len(indices)}"
+                )
                 results[k] = [x for _, x in sorted(zip(indices, v), key=lambda ele: ele[0])]
                 results[k] = torch.stack(results[k])
 

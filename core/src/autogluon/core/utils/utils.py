@@ -1,18 +1,22 @@
+from __future__ import annotations
+
 import logging
 import math
 import pickle
 import random
 import sys
 import time
-from typing import Callable, List, Tuple, Union
+from typing import Callable, List, Tuple
 
 import numpy as np
 import pandas as pd
 import scipy.stats
 from numpy.typing import ArrayLike
 from pandas import DataFrame, Series
-from sklearn.model_selection import LeaveOneGroupOut, RepeatedKFold, RepeatedStratifiedKFold, train_test_split
+from sklearn.model_selection import train_test_split
 
+from autogluon.common.utils.pandas_utils import get_approximate_df_mem_usage
+from autogluon.common.utils.random import get_numpy_seed
 from autogluon.common.utils.resource_utils import ResourceManager
 
 from ..constants import (
@@ -27,72 +31,13 @@ from ..constants import (
     SOFTCLASS,
 )
 from ..metrics import Scorer, accuracy, pinball_loss, root_mean_squared_error
-from .miscs import warning_filter
 
 logger = logging.getLogger(__name__)
 
 
-class CVSplitter:
-    def __init__(self, splitter_cls=None, n_splits=5, n_repeats=1, random_state=0, stratified=False, groups=None):
-        self.n_splits = n_splits
-        self.n_repeats = n_repeats
-        self.random_state = random_state
-        self.stratified = stratified
-        self.groups = groups
-        if splitter_cls is None:
-            splitter_cls = self._get_splitter_cls()
-        self._splitter = self._get_splitter(splitter_cls)
-
-    def _get_splitter_cls(self):
-        if self.groups is not None:
-            num_groups = len(self.groups.unique())
-            if self.n_repeats != 1:
-                raise AssertionError(f"n_repeats must be 1 when split groups are specified. (n_repeats={self.n_repeats})")
-            self.n_splits = num_groups
-            splitter_cls = LeaveOneGroupOut
-            # pass
-        elif self.stratified:
-            splitter_cls = RepeatedStratifiedKFold
-        else:
-            splitter_cls = RepeatedKFold
-        return splitter_cls
-
-    def _get_splitter(self, splitter_cls):
-        if splitter_cls == LeaveOneGroupOut:
-            return splitter_cls()
-        elif splitter_cls in [RepeatedKFold, RepeatedStratifiedKFold]:
-            return splitter_cls(n_splits=self.n_splits, n_repeats=self.n_repeats, random_state=self.random_state)
-        else:
-            raise AssertionError(f"{splitter_cls} is not supported as a valid `splitter_cls` input to CVSplitter.")
-
-    def split(self, X, y):
-        if isinstance(self._splitter, RepeatedStratifiedKFold):
-            # FIXME: There is a bug in sklearn that causes an incorrect ValueError if performing stratification and all classes have fewer than n_splits samples.
-            #  This is hacked by adding a dummy class with n_splits samples, performing the kfold split, then removing the dummy samples from all resulting indices.
-            #  This is very inefficient and complicated and ideally should be fixed in sklearn.
-            with warning_filter():
-                try:
-                    out = [[train_index, test_index] for train_index, test_index in self._splitter.split(X, y)]
-                except:
-                    y_dummy = pd.concat([y, pd.Series([-1] * self.n_splits)], ignore_index=True)
-                    X_dummy = pd.concat([X, X.head(self.n_splits)], ignore_index=True)
-                    invalid_index = set(list(y_dummy.tail(self.n_splits).index))
-                    out = [[train_index, test_index] for train_index, test_index in self._splitter.split(X_dummy, y_dummy)]
-                    len_out = len(out)
-                    for i in range(len_out):
-                        train_index, test_index = out[i]
-                        out[i][0] = [index for index in train_index if index not in invalid_index]
-                        out[i][1] = [index for index in test_index if index not in invalid_index]
-            return out
-        else:
-            return [[train_index, test_index] for train_index, test_index in self._splitter.split(X, y, groups=self.groups)]
-
-
 def setup_compute(nthreads_per_trial, ngpus_per_trial):
     if nthreads_per_trial is None or nthreads_per_trial == "all":
-        nthreads_per_trial = (
-            ResourceManager.get_cpu_count()
-        )  # Use all of processing power / trial by default. To use just half: # int(np.floor(multiprocessing.cpu_count()/2))
+        nthreads_per_trial = ResourceManager.get_cpu_count()  # Use all of processing power / trial by default. To use just half: # int(np.floor(multiprocessing.cpu_count()/2))
     if ngpus_per_trial is None:
         ngpus_per_trial = 0  # do not use GPU by default
     elif ngpus_per_trial == "all":
@@ -122,7 +67,9 @@ def setup_trial_limits(time_limit, num_trials, hyperparameters):
     return time_limit, num_trials
 
 
-def get_leaderboard_pareto_frontier(leaderboard: DataFrame, score_col="score_val", inference_time_col="pred_time_val_full") -> DataFrame:
+def get_leaderboard_pareto_frontier(
+    leaderboard: DataFrame, score_col="score_val", inference_time_col="pred_time_val_full"
+) -> DataFrame:
     """
     Given a set of models, returns in ranked order from best score to worst score models which satisfy the criteria:
     1. No other model in the set has both a lower inference time and a better or equal score.
@@ -132,7 +79,9 @@ def get_leaderboard_pareto_frontier(leaderboard: DataFrame, score_col="score_val
     :param inference_time_col: Column name in leaderboard of model inference times
     :return: Subset of the original leaderboard DataFrame containing only models that are a valid optimal choice at different valuations of score and inference time.
     """
-    leaderboard = leaderboard.sort_values(by=[score_col, inference_time_col], ascending=[False, True]).reset_index(drop=True)
+    leaderboard = leaderboard.sort_values(by=[score_col, inference_time_col], ascending=[False, True]).reset_index(
+        drop=True
+    )
     leaderboard_unique = leaderboard.drop_duplicates(subset=[score_col])
 
     pareto_frontier = []
@@ -147,10 +96,10 @@ def get_leaderboard_pareto_frontier(leaderboard: DataFrame, score_col="score_val
     return leaderboard_pareto_frontier
 
 
-def shuffle_df_rows(X: DataFrame, seed=0, reset_index=True):
+def shuffle_df_rows(X: DataFrame, seed: int = 0, reset_index=True) -> DataFrame:
     """Returns DataFrame with rows shuffled based on seed value."""
     row_count = X.shape[0]
-    np.random.seed(seed)
+    np.random.seed(get_numpy_seed(seed))
     rand_shuffle = np.random.randint(0, row_count, size=row_count)
     X_shuffled = X.iloc[rand_shuffle]
     if reset_index:
@@ -163,7 +112,9 @@ def normalize_binary_probas(y_predprob, eps):
     (pmin, pmax) = (eps, 1 - eps)  # predicted probs outside this range will be remapped into (0,1)
     which_toobig = y_predprob > pmax
     if np.sum(which_toobig) > 0:  # remap overly large probs
-        y_predprob = np.logical_not(which_toobig) * y_predprob + which_toobig * (1 - (eps * np.exp(-(y_predprob - pmax))))
+        y_predprob = np.logical_not(which_toobig) * y_predprob + which_toobig * (
+            1 - (eps * np.exp(-(y_predprob - pmax)))
+        )
     which_toosmall = y_predprob < pmin
     if np.sum(which_toosmall) > 0:  # remap overly small probs
         y_predprob = np.logical_not(which_toosmall) * y_predprob + which_toosmall * eps * np.exp(-(pmin - y_predprob))
@@ -182,7 +133,7 @@ def normalize_multi_probas(y_predprob, eps):
     return y_predprob
 
 
-def default_holdout_frac(num_train_rows, hyperparameter_tune=False):
+def default_holdout_frac(num_train_rows, hyperparameter_tune: bool = False):
     """Returns default holdout_frac used in fit().
     Between row count 5,000 and 25,000 keep 0.1 holdout_frac, as we want to grow validation set to a stable 2500 examples.
     """
@@ -192,7 +143,9 @@ def default_holdout_frac(num_train_rows, hyperparameter_tune=False):
         holdout_frac = max(0.01, min(0.1, 2500.0 / num_train_rows))
 
     if hyperparameter_tune:
-        holdout_frac = min(0.2, holdout_frac * 2)  # We want to allocate more validation data for HPO to avoid overfitting
+        holdout_frac = min(
+            0.2, holdout_frac * 2
+        )  # We want to allocate more validation data for HPO to avoid overfitting
 
     return holdout_frac
 
@@ -224,21 +177,23 @@ def augment_rare_classes(X, label, threshold):
         # This avoids crash when the only invalid classes were those that appeared 0 times
         return X
 
-    aug_df = None
+    dfs_to_add = []
     for clss, n_clss in class_counts_invalid.items():
         n_toadd = threshold - n_clss
         clss_df = X.loc[X[label] == clss]
-        if aug_df is None:
-            aug_df = clss_df[:0].copy()
         duplicate_times = int(np.floor(n_toadd / n_clss))
         remainder = n_toadd % n_clss
-        new_df = clss_df.copy()
-        new_df = new_df[:remainder]
-        while duplicate_times > 0:
+
+        if duplicate_times > 0:
             logger.debug(f"Duplicating data from rare class: {clss}")
-            duplicate_times -= 1
-            new_df = pd.concat([new_df, clss_df], axis=0)
-        aug_df = pd.concat([aug_df, new_df], axis=0)
+            dfs_to_add.extend([clss_df] * duplicate_times)
+        if remainder > 0:
+            dfs_to_add.append(clss_df.iloc[:remainder])
+
+    if not dfs_to_add:
+        return X
+
+    aug_df = pd.concat(dfs_to_add, axis=0)
 
     # Ensure new samples generated via augmentation have unique indices
     aug_df = aug_df.reset_index(drop=True)
@@ -261,7 +216,9 @@ def augment_rare_classes(X, label, threshold):
     return X
 
 
-def get_pred_from_proba_df(y_pred_proba: pd.DataFrame, problem_type: str = BINARY, decision_threshold: float = None) -> pd.Series:
+def get_pred_from_proba_df(
+    y_pred_proba: pd.DataFrame, problem_type: str = BINARY, decision_threshold: float = None
+) -> pd.Series:
     """
     From input DataFrame of pred_proba, return Series of pred.
     The input DataFrame's columns must be the names of the target classes.
@@ -272,7 +229,9 @@ def get_pred_from_proba_df(y_pred_proba: pd.DataFrame, problem_type: str = BINAR
         y_pred = y_pred_proba
     elif problem_type == BINARY and decision_threshold is not None:
         negative_class, positive_class = y_pred_proba.columns
-        y_pred = get_pred_from_proba(y_pred_proba=y_pred_proba.values, problem_type=problem_type, decision_threshold=decision_threshold)
+        y_pred = get_pred_from_proba(
+            y_pred_proba=y_pred_proba.values, problem_type=problem_type, decision_threshold=decision_threshold
+        )
         y_pred = [positive_class if pred == 1 else negative_class for pred in y_pred]
         y_pred = pd.Series(data=y_pred, index=y_pred_proba.index)
     else:
@@ -280,7 +239,9 @@ def get_pred_from_proba_df(y_pred_proba: pd.DataFrame, problem_type: str = BINAR
     return y_pred
 
 
-def get_pred_from_proba(y_pred_proba: np.ndarray, problem_type: str = BINARY, decision_threshold: float = None) -> np.ndarray:
+def get_pred_from_proba(
+    y_pred_proba: np.ndarray, problem_type: str = BINARY, decision_threshold: float = None
+) -> np.ndarray:
     if problem_type == BINARY:
         if decision_threshold is None:
             decision_threshold = 0.5
@@ -304,7 +265,9 @@ def get_pred_from_proba(y_pred_proba: np.ndarray, problem_type: str = BINARY, de
     return y_pred
 
 
-def convert_pred_probas_to_df(pred_proba_list: List[ArrayLike], columns: List[str], problem_type: str, index: pd.Index = None) -> DataFrame:
+def convert_pred_probas_to_df(
+    pred_proba_list: List[ArrayLike], columns: List[str], problem_type: str, index: pd.Index = None
+) -> DataFrame:
     """
     Converts a list of pred_proba model outputs to a DataFrame
 
@@ -359,8 +322,15 @@ def extract_label(data: DataFrame, label: str) -> (DataFrame, Series):
 
 
 def generate_train_test_split_combined(
-    data: DataFrame, label: str, problem_type: str, test_size: float = 0.1, random_state: int = 0, min_cls_count_train: int = 1
-) -> (DataFrame, DataFrame):
+    data: DataFrame,
+    label: str,
+    problem_type: str = None,
+    test_size: int | float = None,
+    train_size: int | float = None,
+    random_state: int = 0,
+    stratify: bool | Series = None,
+    min_cls_count_train: int = 1,
+) -> Tuple[DataFrame, DataFrame]:
     """
     Generate a train test split from a DataFrame that contains the label column.
 
@@ -371,12 +341,27 @@ def generate_train_test_split_combined(
     label : str
         The label column name.
         Used for stratification and to ensure all classes in multiclass classification are preserved in train data.
-    problem_type : str
+    problem_type : str, default = None
         The problem_type the label is used for. Determines if stratification is used.
+        If "binary" or "multiclass", enables the `min_cls_count_train` logic.
         Options: ["binary", "multiclass", "regression", "softclass", "quantile"]
-    test_size : float, default = 0.1
-        The proportion of data to use for the test set.
-        The remaining (1 - test_size) of data will be used for the training set.
+    stratify : bool | Series, default = None
+        The stratification strategy.
+        If True, will stratify using `y`.
+        If False, will not use stratification.
+        If None and problem_type is specified, will be set to True or False depending on the problem_type.
+            True if problem_type in ["binary", "multiclass"], else False.
+        If None and problem_type is None, defaults to False.
+    test_size : int | float, default = None
+        If float, should be between 0.0 and 1.0 and represent the proportion of the dataset to include in the test split.
+        If int, represents the absolute number of test samples.
+        If test_size is None and train_size is None, test_size defaults to 0.1
+    train_size : int | float, default = None
+        If float, should be between 0.0 and 1.0 and represent the proportion of the dataset to include in the train split.
+        If int, represents the absolute number of train samples.
+        If test_size is None, represents the complement of `test_size`.
+        For example, `train_size=0.7, test_size=None` is equivalent to `train_size=None, test_size=0.3`.
+        Note: It is possible for exceptions to be raised if both train_size and test_size are specified, stratification is enabled, and rare classes exist.
     random_state : int, default = 0
         Random seed to use during the split.
     min_cls_count_train : int, default = 1
@@ -392,7 +377,14 @@ def generate_train_test_split_combined(
     """
     X, y = extract_label(data=data, label=label)
     train_data, test_data, y_train, y_test = generate_train_test_split(
-        X=X, y=y, problem_type=problem_type, test_size=test_size, random_state=random_state, min_cls_count_train=min_cls_count_train
+        X=X,
+        y=y,
+        problem_type=problem_type,
+        test_size=test_size,
+        train_size=train_size,
+        random_state=random_state,
+        stratify=stratify,
+        min_cls_count_train=min_cls_count_train,
     )
     train_data[label] = y_train
     test_data[label] = y_test
@@ -400,7 +392,14 @@ def generate_train_test_split_combined(
 
 
 def generate_train_test_split(
-    X: DataFrame, y: Series, problem_type: str, test_size: Union[float, int] = 0.1, random_state=0, min_cls_count_train=1
+    X: DataFrame,
+    y: Series,
+    problem_type: str = None,
+    test_size: int | float = None,
+    train_size: int | float = None,
+    random_state: int = 0,
+    stratify: bool | Series = None,
+    min_cls_count_train: int = 1,
 ) -> Tuple[DataFrame, DataFrame, Series, Series]:
     """
     Generate a train test split from input X, y.
@@ -413,15 +412,27 @@ def generate_train_test_split(
     y : Series
         pd.Series containing the label with matching indices to X.
         Used for stratification and to ensure all classes in multiclass classification are preserved in train data.
-    problem_type : str
+    problem_type : str, default = None
         The problem_type the label is used for. Determines if stratification is used.
+        If "binary" or "multiclass", enables the `min_cls_count_train` logic.
         Options: ["binary", "multiclass", "regression", "softclass", "quantile"]
-    test_size : float, default = 0.1
-        The proportion of data to use for the test set.
-        The remaining (1 - test_size) of data will be used for the training set.
-    test_size : float or int, default = 0.1
+    stratify : bool | Series, default = None
+        The stratification strategy.
+        If True, will stratify using `y`.
+        If False, will not use stratification.
+        If None and problem_type is specified, will be set to True or False depending on the problem_type.
+            True if problem_type in ["binary", "multiclass"], else False.
+        If None and problem_type is None, defaults to False.
+    test_size : int | float, default = None
         If float, should be between 0.0 and 1.0 and represent the proportion of the dataset to include in the test split.
         If int, represents the absolute number of test samples.
+        If test_size is None and train_size is None, test_size defaults to 0.1
+    train_size : int | float, default = None
+        If float, should be between 0.0 and 1.0 and represent the proportion of the dataset to include in the train split.
+        If int, represents the absolute number of train samples.
+        If test_size is None, represents the complement of `test_size`.
+        For example, `train_size=0.7, test_size=None` is equivalent to `train_size=None, test_size=0.3`.
+        Note: It is possible for exceptions to be raised if both train_size and test_size are specified, stratification is enabled, and rare classes exist.
     random_state : int, default = 0
         Random seed to use during the split.
     min_cls_count_train : int, default = 1
@@ -437,31 +448,64 @@ def generate_train_test_split(
 
     """
     if len(X) == 1:
-        raise ValueError(f"Cannot split data into train/val as it contains only one sample.")
-    if isinstance(test_size, float):
-        if (test_size <= 0.0) or (test_size >= 1.0):
-            raise ValueError("fraction of data to hold-out must be specified between 0 and 1")
-    elif isinstance(test_size, int):
-        assert test_size > 0
-    valid_problem_types = [BINARY, MULTICLASS, REGRESSION, SOFTCLASS, QUANTILE]
-    assert problem_type in valid_problem_types, f'Unknown problem type "{problem_type}" | Valid problem types: {valid_problem_types}'
+        raise ValueError("Cannot split data into train/val as it contains only one sample.")
+    if test_size is None and train_size is None:
+        test_size = 0.1
+    if train_size is not None:
+        if isinstance(train_size, float):
+            if (train_size <= 0.0) or (train_size >= 1.0):
+                raise ValueError(f"train_size fraction must be specified between 0 and 1. Value: {train_size}")
+        elif isinstance(train_size, int):
+            assert train_size > 0
+        else:
+            raise TypeError(
+                f"train_size was specified, but is not of type int or float! Type: {type(train_size)}, Value: {train_size}"
+            )
+    if train_size is not None and test_size is None:
+        # Set train_size to None to avoid edge-case exceptions with rare classes during stratification
+        if isinstance(train_size, float):
+            test_size = (
+                1.0 - train_size - 1e-10
+            )  # -1e-10 to fix numerical imprecision issues, ensuring `test_size=0.1` gets same result as `train_size=0.9`
+        else:
+            test_size = len(X) - train_size
+        train_size = None
+    if test_size is not None:
+        if isinstance(test_size, float):
+            if (test_size <= 0.0) or (test_size >= 1.0):
+                raise ValueError(f"test_size fraction must be specified between 0 and 1. Value: {test_size}")
+        elif isinstance(test_size, int):
+            assert test_size > 0
+        else:
+            raise TypeError(
+                f"test_size was specified, but is not of type int or float! Type: {type(test_size)}, Value: {test_size}"
+            )
+    if problem_type is not None:
+        valid_problem_types = [BINARY, MULTICLASS, REGRESSION, SOFTCLASS, QUANTILE]
+        assert problem_type in valid_problem_types, (
+            f'Unknown problem type "{problem_type}" | Valid problem types: {valid_problem_types}'
+        )
 
     X_split = X
     y_split = y
-    if problem_type in [BINARY, MULTICLASS]:
-        stratify = y
-    else:
-        stratify = None
+    if stratify is None:
+        if problem_type is not None and problem_type in [BINARY, MULTICLASS]:
+            stratify = y
+    elif isinstance(stratify, bool):
+        stratify = y if stratify else None
 
     # This code block is necessary to avoid crashing when performing a stratified split and only 1 sample exists for a class.
     # This code will ensure that the sample will be part of the train split, meaning the test split will have 0 samples of the rare class.
     rare_indices = None
     if stratify is not None:
         cls_counts = y.value_counts()
+        cls_counts = cls_counts[cls_counts > 0]  # > 0 to avoid error if missing class when dtype is categorical.
         cls_counts_invalid = cls_counts[cls_counts < min_cls_count_train]
 
         if len(cls_counts_invalid) > 0:
-            logger.error(f"ERROR: Classes have too few samples to split the data! At least {min_cls_count_train} are required.")
+            logger.error(
+                f"ERROR: Classes have too few samples to split the data! At least {min_cls_count_train} are required."
+            )
             logger.error(cls_counts_invalid)
             raise AssertionError("Not enough data to split data into train and val without dropping classes!")
         elif min_cls_count_train < 2:
@@ -476,7 +520,13 @@ def generate_train_test_split(
 
     try:
         X_train, X_test, y_train, y_test = train_test_split(
-            X_split, y_split.values, test_size=test_size, shuffle=True, random_state=random_state, stratify=stratify
+            X_split,
+            y_split.values,
+            test_size=test_size,
+            train_size=train_size,
+            shuffle=True,
+            random_state=random_state,
+            stratify=stratify,
         )
     except ValueError:
         # This logic is necessary to avoid an edge-case limitation of scikit-learn's train_test_split function that leads to the following error:
@@ -487,24 +537,29 @@ def generate_train_test_split(
         if stratify is None:
             raise
         X_train, X_test, y_train, y_test = train_test_split(
-            X_split, y_split.values, test_size=test_size, shuffle=True, random_state=random_state, stratify=None
+            X_split,
+            y_split.values,
+            test_size=test_size,
+            train_size=train_size,
+            shuffle=True,
+            random_state=random_state,
+            stratify=None,
         )
         if len(y_test) >= len(y_split.unique()):
             # This should never occur, otherwise the original exception is not an expected one
             raise
-    if problem_type != SOFTCLASS:
-        y_train = pd.Series(y_train, index=X_train.index)
-        y_test = pd.Series(y_test, index=X_test.index)
-    else:
-        y_train = pd.DataFrame(y_train, index=X_train.index)
-        y_test = pd.DataFrame(y_test, index=X_test.index)
+    cls_y = type(y)
+    y_train = cls_y(y_train, index=X_train.index)
+    y_test = cls_y(y_test, index=X_test.index)
 
     if rare_indices:
         X_train = pd.concat([X_train, X.loc[rare_indices]])
         y_train = pd.concat([y_train, y.loc[rare_indices]])
 
-    if problem_type in [BINARY, MULTICLASS]:
-        class_counts_dict_orig = y.value_counts().to_dict()
+    if problem_type is not None and problem_type in [BINARY, MULTICLASS]:
+        class_counts_dict_orig = y.value_counts()
+        class_counts_dict_orig = class_counts_dict_orig[class_counts_dict_orig > 0]
+        class_counts_dict_orig = class_counts_dict_orig.to_dict()
         class_counts_dict = y_train.value_counts().to_dict()
         class_counts_dict_test = y_test.value_counts().to_dict()
 
@@ -548,7 +603,9 @@ def normalize_pred_probas(y_predprob, problem_type, eps=1e-7):
 
     if problem_type in [BINARY, REGRESSION]:
         if len(y_predprob.shape) > 1 and min(y_predprob.shape) > 1:
-            raise ValueError(f"cannot call normalize_pred_probas with problem_type={problem_type} and y_predprob.shape=={y_predprob.shape}")
+            raise ValueError(
+                f"cannot call normalize_pred_probas with problem_type={problem_type} and y_predprob.shape=={y_predprob.shape}"
+            )
         return normalize_binary_probas(y_predprob, eps)
     elif problem_type in [MULTICLASS, SOFTCLASS]:  # clip all probs below at eps and then renormalize
         if len(y_predprob.shape) == 1:
@@ -556,7 +613,7 @@ def normalize_pred_probas(y_predprob, problem_type, eps=1e-7):
         else:
             return normalize_multi_probas(y_predprob, eps)
     else:
-        raise ValueError(f"Invalid problem_type")
+        raise ValueError("Invalid problem_type")
 
 
 def infer_problem_type(y: Series, silent=False) -> str:
@@ -574,9 +631,7 @@ def infer_problem_type(y: Series, silent=False) -> str:
     unique_values = y.unique()
 
     if num_rows > LARGE_DATA_THRESHOLD:
-        regression_threshold = (
-            REGRESS_THRESHOLD_LARGE_DATA  # if the unique-ratio is less than this, we assume multiclass classification, even when labels are integers
-        )
+        regression_threshold = REGRESS_THRESHOLD_LARGE_DATA  # if the unique-ratio is less than this, we assume multiclass classification, even when labels are integers
     else:
         regression_threshold = REGRESS_THRESHOLD_SMALL_DATA
 
@@ -628,7 +683,10 @@ def infer_problem_type(y: Series, silent=False) -> str:
             y_min = y.min()
             y_mean = y.mean()
             y_stddev = y.std()
-            logger.log(20, f"\tLabel info (max, min, mean, stddev): ({y_max}, {y_min}, {round(y_mean, 5)}, {round(y_stddev, 5)})")
+            logger.log(
+                20,
+                f"\tLabel info (max, min, mean, stddev): ({y_max}, {y_min}, {round(y_mean, 5)}, {round(y_stddev, 5)})",
+            )
 
         logger.log(
             25,
@@ -659,14 +717,22 @@ def extract_column(X, col_name):
     return X, w
 
 
-def compute_weighted_metric(y, y_pred, metric, weights, weight_evaluation=None, **kwargs):
+# TODO: v1.4: Remove this
+def compute_weighted_metric(
+    y: np.ndarray, y_pred: np.ndarray, metric: Scorer, weights: np.ndarray, weight_evaluation: bool = None, **kwargs
+) -> float:
     """Report weighted metric if: weights is not None, weight_evaluation=True, and the given metric supports sample weights.
     If weight_evaluation=None, it will be set to False if weights=None, True otherwise.
     """
+    logger.log(
+        30,
+        "WARNING: `compute_weighted_metric` is deprecated as of AutoGluon 1.2 and will be removed in AutoGluon 1.4. "
+        "Please use `autogluon.core.metrics.compute_metric` instead.",
+    )
     if not metric.needs_quantile:
         kwargs.pop("quantile_levels", None)
     if weight_evaluation is None:
-        weight_evaluation = not (weights is None)
+        weight_evaluation = weights is not None
     if weight_evaluation and weights is None:
         raise ValueError("Sample weights cannot be None when weight_evaluation=True.")
     if not weight_evaluation:
@@ -678,7 +744,10 @@ def compute_weighted_metric(y, y_pred, metric, weights, weight_evaluation=None, 
             metric_name = metric.name
         else:
             metric_name = metric
-        logger.log(30, f"WARNING: eval_metric='{metric_name}' does not support sample weights so they will be ignored in reported metric.")
+        logger.log(
+            30,
+            f"WARNING: eval_metric='{metric_name}' does not support sample weights so they will be ignored in reported metric.",
+        )
         weighted_metric = metric(y, y_pred, **kwargs)
     return weighted_metric
 
@@ -701,6 +770,9 @@ def compute_permutation_feature_importance(
     log_prefix="",
     importance_as_list=False,
     random_state=0,
+    max_memory_ratio=0.1,
+    max_feature_batch_count=None,
+    max_rows_per_batch=None,
     **kwargs,
 ) -> pd.DataFrame:
     """
@@ -846,17 +918,37 @@ def compute_permutation_feature_importance(
             if shuffle_repeat == 0:
                 if not silent:
                     time_score = time.time() - time_start_score
-                    time_estimated = ((num_features + 1) * time_score) * num_shuffle_sets + time_start_score - time_start
+                    time_estimated = (
+                        ((num_features + 1) * time_score) * num_shuffle_sets + time_start_score - time_start
+                    )
                     time_estimated_per_set = time_estimated / num_shuffle_sets
-                    logger.log(20, f"{log_prefix}\t{round(time_estimated, 2)}s\t= Expected runtime ({round(time_estimated_per_set, 2)}s per shuffle set)")
+                    logger.log(
+                        20,
+                        f"{log_prefix}\t{round(time_estimated, 2)}s\t= Expected runtime ({round(time_estimated_per_set, 2)}s per shuffle set)",
+                    )
 
                 if transform_func is None:
-                    feature_batch_count = _get_safe_fi_batch_count(X=X, num_features=num_features)
+                    feature_batch_count = _get_safe_fi_batch_count(
+                        X=X,
+                        num_features=num_features,
+                        max_memory_ratio=max_memory_ratio,
+                        max_feature_batch_count=max_feature_batch_count,
+                        max_rows_per_batch=max_rows_per_batch,
+                    )
                 else:
-                    feature_batch_count = _get_safe_fi_batch_count(X=X, num_features=num_features, X_transformed=X_transformed)
+                    feature_batch_count = _get_safe_fi_batch_count(
+                        X=X,
+                        num_features=num_features,
+                        X_transformed=X_transformed,
+                        max_memory_ratio=max_memory_ratio,
+                        max_feature_batch_count=max_feature_batch_count,
+                        max_rows_per_batch=max_rows_per_batch,
+                    )
 
             # creating copy of original data N=feature_batch_count times for parallel processing
-            X_raw = pd.concat([X.copy() for _ in range(feature_batch_count)], ignore_index=True, sort=False).reset_index(drop=True)
+            X_raw = pd.concat(
+                [X.copy() for _ in range(feature_batch_count)], ignore_index=True, sort=False
+            ).reset_index(drop=True)
 
         row_count = len(X)
 
@@ -879,7 +971,11 @@ def compute_permutation_feature_importance(
 
             if (num_features_processing < feature_batch_count) and final_iteration:
                 X_raw_transformed = X_raw.loc[: row_count * num_features_processing - 1]
-                X_raw_transformed = X_raw_transformed if transform_func is None else transform_func(X_raw_transformed, **transform_func_kwargs)
+                X_raw_transformed = (
+                    X_raw_transformed
+                    if transform_func is None
+                    else transform_func(X_raw_transformed, **transform_func_kwargs)
+                )
             else:
                 X_raw_transformed = X_raw if transform_func is None else transform_func(X_raw, **transform_func_kwargs)
             y_pred = predict_func(X_raw_transformed, **predict_func_kwargs)
@@ -940,7 +1036,7 @@ def _validate_features(features: list, valid_features: list):
             feature_list = feature[1]
             feature_list_set = set(feature_list)
             if len(feature_list_set) != len(feature_list):
-                raise ValueError(f"Feature list contains duplicate features:\n" f"{feature_list}")
+                raise ValueError(f"Feature list contains duplicate features:\n{feature_list}")
             for feature_in_list in feature_list:
                 if feature_in_list not in valid_features:
                     raise ValueError(
@@ -953,7 +1049,7 @@ def _validate_features(features: list, valid_features: list):
         else:
             feature_name = feature
             if feature_name not in valid_features:
-                raise ValueError(f"Feature does not exist in data: {feature_name}\n" f"Valid Features:\n" f"{valid_features}")
+                raise ValueError(f"Feature does not exist in data: {feature_name}\nValid Features:\n{valid_features}")
         if feature_name in used_features:
             raise ValueError(f"Feature is present multiple times in feature list: {feature_name}")
         used_features.add(feature_name)
@@ -966,7 +1062,9 @@ def _compute_fi_with_stddev(fi_list_dict: dict, importance_as_list=False) -> Dat
     fi_p_value = dict()
     fi_n = dict()
     for feature in features:
-        fi[feature], fi_stddev[feature], fi_p_value[feature], fi_n[feature] = _compute_mean_stddev_and_p_value(fi_list_dict[feature])
+        fi[feature], fi_stddev[feature], fi_p_value[feature], fi_n[feature] = _compute_mean_stddev_and_p_value(
+            fi_list_dict[feature]
+        )
         if importance_as_list:
             fi[feature] = fi_list_dict[feature]
 
@@ -987,20 +1085,51 @@ def _compute_mean_stddev_and_p_value(values: list):
     n = len(values)
     p_value = np.nan
     stddev = np.std(values, ddof=1) if n > 1 else np.nan
-    if stddev != np.nan and stddev != 0:
+    if not np.isnan(stddev) and stddev != 0:
         t_stat = mean / (stddev / math.sqrt(n))
         p_value = scipy.stats.t.sf(t_stat, n - 1)
     elif stddev == 0:
-        p_value = 0.5
+        if mean > 0:
+            p_value = 0.0
+        elif mean < 0:
+            p_value = 1.0
+        else:
+            p_value = 0.5
 
     return mean, stddev, p_value, n
 
 
-def _get_safe_fi_batch_count(X, num_features, X_transformed=None, max_memory_ratio=0.2, max_feature_batch_count=200):
+def _get_safe_fi_batch_count(
+    X,
+    num_features,
+    X_transformed=None,
+    max_memory_ratio=0.1,
+    max_feature_batch_count=None,
+    max_rows_per_batch=100_000,
+):
+    if max_rows_per_batch is None:
+        max_rows_per_batch = 100000
     # calculating maximum number of features that are safe to process in parallel
-    X_size_bytes = sys.getsizeof(pickle.dumps(X, protocol=4))
+    if max_feature_batch_count is None:
+        # If None, use a heuristic: limit total rows*features processed in one batch to ~100,000.
+        # This balances memory usage and vectorization speed.
+        # For example, if X has 5 rows, batch size will be capped at 10,000 features (hard cap).
+        # If X has 1,000 rows, batch size can include 100 features.
+        # If X has 1,000,000 rows, batch size will be 1 features.
+        num_rows = X.shape[0] if hasattr(X, "shape") else len(X)
+        max_feature_batch_count = max(1, max_rows_per_batch // num_rows)
+        max_feature_batch_count = min(max_feature_batch_count, 10000)
+
+    if isinstance(X, pd.DataFrame):
+        X_size_bytes = get_approximate_df_mem_usage(X).sum()
+    else:
+        X_size_bytes = sys.getsizeof(pickle.dumps(X, protocol=4))
+
     if X_transformed is not None:
-        X_size_bytes += sys.getsizeof(pickle.dumps(X_transformed, protocol=4))
+        if isinstance(X_transformed, pd.DataFrame):
+            X_size_bytes += get_approximate_df_mem_usage(X_transformed).sum()
+        else:
+            X_size_bytes += sys.getsizeof(pickle.dumps(X_transformed, protocol=4))
     available_mem = ResourceManager.get_available_virtual_mem()
     X_memory_ratio = X_size_bytes / available_mem
 

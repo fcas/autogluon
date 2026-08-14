@@ -1,12 +1,40 @@
-[tool.black]
-line-length = 119
-target-version = ['py38', 'py39', 'py310']
+# --- uv workspace (whole monorepo) ---
+# Virtual workspace root. Members are PEP 621 packages (in place; no packages/ move).
+[tool.uv.workspace]
+members = ["common", "core", "features", "tabular", "timeseries", "multimodal", "autogluon"]
 
-[tool.isort]
-known_first_party = "autogluon"
-known_third_party = [
+# Pin resolution so a newly-released dep can't make `uv lock --check` go red. Bump when running `uv lock`.
+[tool.uv]
+exclude-newer = "2026-08-01"
+
+# Resolve sibling autogluon packages to the local workspace members instead of PyPI for dev.
+# Each member's deps (incl. shared third-party caps and the exact `==<version>` sibling pins) are
+# supplied dynamically by its thin setup.py from core/_setup_utils.py — the single source of truth
+# for caps — so they land in both the workspace lock AND published wheels' Requires-Dist.
+[tool.uv.sources]
+"autogluon.common" = { workspace = true }
+"autogluon.core" = { workspace = true }
+"autogluon.features" = { workspace = true }
+"autogluon.tabular" = { workspace = true }
+"autogluon.timeseries" = { workspace = true }
+"autogluon.multimodal" = { workspace = true }
+# --- end uv workspace block ---
+
+[tool.ruff]
+line-length = 119
+target-version = "py310"
+# Explicit rule selection (ruff's pre-0.16 defaults): ruff 0.16 expanded its default
+# `lint.select`, which would otherwise change what `ruff check` enforces on every
+# ruff upgrade. Extend deliberately, not via ruff version bumps.
+lint.select = ["E4", "E7", "E9", "F"]
+lint.ignore = [
+    "E501",  # Line too long
+    "E731",  # Do not assign a `lambda` expression, use a `def`
+    "E722",  # Do not use bare `except`
+]
+lint.isort.known-first-party = ["autogluon"]
+lint.isort.known-third-party = [
     "gluonts",
-    "mxnet",
     "networkx",
     "numpy",
     "pandas",
@@ -14,8 +42,6 @@ known_third_party = [
     "pytest",
     "scipy",
     "sklearn",
-    "sktime",
-    "statsmodels",
     "tqdm",
     "Pillow",
     "boto3",
@@ -23,32 +49,33 @@ known_third_party = [
     "timm",
     "torch",
     "torchvision",
-    "fairscale",
     "scikit-image",
-    "smart_open",
     "lightning",
     "torchmetrics",
     "transformers",
-    "nptyping",
     "omegaconf",
     "pytorch-metric-learning",
     "nlpaug",
     "nltk",
 ]
-line_length = 119
-profile = "black"
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Unused imports in __init__.py files
 
 
 [tool.codespell]
 skip = '.git,*.pdf,*.svg,*.ipynb,*.csv,kaggle_feedback_prize'
 #
-ignore-words-list = 'mape,ans,2st,fo,nd,te,fpr,coo,rouge'
+ignore-words-list = 'mape,ans,2st,fo,nd,te,fpr,coo,rouge,SME,NoES'
 
 
-[tool.ruff]
-lint.ignore = [
-    "E501",  # Line too long
-    "E731",  # Do not assign a `lambda` expression, use a `def`
-    "E722",  # Do not use bare `except`
+[tool.pyright]
+pythonVersion = "3.10"
+include = [
+    "timeseries/src/"
 ]
-extend-exclude = ["__init__.py"]
+extraPaths = [
+    "common/src",
+    "core/src",
+    "tabular/src",
+    "timeseries/src",
+]
